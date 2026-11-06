@@ -201,6 +201,14 @@ class StorageIntegrationTest(unittest.TestCase):
                     if quality != "720p":
                         self.assertNotIn("720x1280", prompt)
 
+    def test_video_wait_budget_is_bounded_and_keeps_explicit_override(self):
+        with patch.object(self.app.CFG, "video_timeout", 600):
+            for duration, expected in ((6, 600), (10, 600), (15, 600), (20, 800), (30, 1200), (120, 1800)):
+                req = self.app.VideoRequest(prompt="fixture", duration=duration)
+                self.assertEqual(self.app._video_generation_timeout(req), expected)
+            explicit = self.app.VideoRequest(prompt="fixture", duration=30, timeout=90)
+            self.assertEqual(self.app._video_generation_timeout(explicit), 90)
+
     def test_storage_failure_remains_completed_and_does_not_regenerate(self):
         with patch.object(self.storage, "store_original", side_effect=self.failing_store), \
              patch.object(self.app, "_run_generation", return_value=(self.result, "fixture")) as generate:

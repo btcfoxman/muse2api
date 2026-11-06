@@ -30,7 +30,8 @@ def load_waiter(path):
     return scope
 
 
-def scenario(source, text, ready_at=25, timeout=90, later_text=None, stop_until=0, cover=False):
+def scenario(source, text, ready_at=25, timeout=90, later_text=None, stop_until=0,
+             cover=False, rendering_until=0, base_agent_cnt=0, baseline_video=False):
     scope = load_waiter(source)
     clock = SimpleNamespace(now=0.0)
     def sleep(seconds):
@@ -40,7 +41,9 @@ def scenario(source, text, ready_at=25, timeout=90, later_text=None, stop_until=
     def state(_script):
         current = later_text[1] if later_text and clock.now >= later_text[0] else text
         return json.dumps({"cnt": 1, "txt": current, "tail": current,
-                           "stop": clock.now < stop_until, "path": "/thread/fixture"})
+                           "stop": clock.now < stop_until,
+                           "rendering": clock.now < rendering_until,
+                           "path": "/thread/fixture"})
     waiter.page = SimpleNamespace(js=state)
     waiter._scroll_bottom = lambda: None
     def attachments():
@@ -50,10 +53,15 @@ def scenario(source, text, ready_at=25, timeout=90, later_text=None, stop_until=
         if cover:
             return [{"tid": "hatch-chat-attachment-presentation-video", "src": "blob:cover",
                      "vSrc": "", "hasVideo": False, "w": 720, "h": 1280}]
+        if baseline_video:
+            return [{"tid": "hatch-chat-attachment-presentation-video", "src": "blob:old",
+                     "vSrc": "blob:old", "hasVideo": True, "w": 720, "h": 1280}]
         return []
     waiter.attachments = attachments
     try:
-        result = waiter._wait_attachment("", timeout, "video")
+        result = waiter._wait_attachment("blob:old" if baseline_video else "", timeout, "video",
+                                         base_agent_cnt=base_agent_cnt,
+                                         base_att_cnt=int(baseline_video))
         outcome = "video" if result and result.get("vSrc") else "timeout"
         return {"outcome": outcome, "elapsed": round(clock.now, 1)}
     except scope["MuseGenerationError"] as exc:
@@ -72,6 +80,24 @@ def cases(source):
             result[f"{label}_{delay}"] = scenario(source, text, ready_at=delay)
     result["claim_no_attachment"] = scenario(source, cn, ready_at=None, timeout=45)
     result["claim_only_cover"] = scenario(source, cn, ready_at=None, timeout=45, cover=True)
+    result["terminal_claim"] = scenario(source, cn, ready_at=None, timeout=120)
+    result["terminal_cover"] = scenario(source, cn, ready_at=None, timeout=120, cover=True)
+    result["terminal_clarification"] = scenario(
+        source, "Choose the clean 20-second version or request another generation.",
+        ready_at=None, timeout=120)
+    result["terminal_baseline_video"] = scenario(
+        source, cn, ready_at=None, timeout=120, baseline_video=True)
+    result["stop_still_active"] = scenario(source, cn, ready_at=None, timeout=120, stop_until=180)
+    result["stop_late_video"] = scenario(source, cn, ready_at=95, timeout=120, stop_until=90)
+    result["rendering_still_active"] = scenario(
+        source, cn, ready_at=None, timeout=120, rendering_until=180)
+    result["rendering_late_video"] = scenario(
+        source, cn, ready_at=95, timeout=120, rendering_until=90)
+    result["old_reply"] = scenario(source, cn, ready_at=None, timeout=120, base_agent_cnt=1)
+    result["old_reply_old_video"] = scenario(
+        source, cn, ready_at=None, timeout=120, base_agent_cnt=1, baseline_video=True)
+    result["updated_reply_grace"] = scenario(
+        source, cn, ready_at=100, timeout=120, later_text=(50, "The revised video is ready."))
     result["stop_lifecycle"] = scenario(source, cn, ready_at=30, stop_until=20)
     refusal = "视频没生成成功：你这个账号所在的国家/地区目前不支持视频生成。"
     result["explicit_refusal"] = scenario(source, refusal)
@@ -86,7 +112,7 @@ def cases(source):
         ("claim_then_upload_failed", "The video was generated, but the upload failed."),
         ("failed_after_claim", "视频已生成，但随后处理失败，无法提供视频。"),
     ):
-        result[label] = scenario(source, text)
+        result[label] = scenario(source, text, ready_at=None, timeout=120)
     return result
 
 
@@ -104,9 +130,17 @@ def main():
             assert item["outcome"] == "timeout" and 45 <= item["elapsed"] < 46, (name, item)
         elif name == "stop_lifecycle":
             assert item["outcome"] == "video" and item["elapsed"] >= 30, (name, item)
-        else:
+        elif name in ("stop_late_video", "rendering_late_video", "updated_reply_grace"):
+            assert item["outcome"] == "video", (name, item)
+            assert item["elapsed"] >= (100 if name == "updated_reply_grace" else 95), (name, item)
+        elif name in ("stop_still_active", "rendering_still_active", "old_reply", "old_reply_old_video"):
+            assert item["outcome"] == "timeout" and 120 <= item["elapsed"] < 121, (name, item)
+        elif name in ("explicit_refusal", "claim_then_refusal"):
             assert item["outcome"] == "MuseModelRefusalError", (name, item)
             assert item["elapsed"] < 25, (name, item)
+        else:
+            assert item["outcome"] == "MuseModelRefusalError", (name, item)
+            assert 60 <= item["elapsed"] < 62, (name, item)
     print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     print(f"PASS: {len(result)} late-video, deadline, cover and refusal cases")
 

@@ -1000,7 +1000,7 @@ def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
             parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个16:9横屏宽屏视频（16:9 widescreen landscape video，时长严格为 {dur} 秒）：{user_prompt}")
     elif ratio:
         lead = reference_instruction if has_ref else "全新文生视频创作（只使用本次提示词，严禁参考任何历史素材）"
-        parts.append(f"{lead}：生成一个严格 {ratio} 画幅的视频（{pixel_note}，时长严格为 {dur} 秒，完整动态画面，无黑边，无重复片段或拼接）：{user_prompt}")
+        parts.append(f"{lead}：生成一个严格 {ratio} 画幅的视频（{pixel_note}，时长严格为 {dur} 秒，完整动态画面，无黑边，无重复片段）：{user_prompt}")
     else:
         if has_ref:
             parts.append(f"{reference_instruction}：生成动态{gen_word}（时长严格为 {dur} 秒）：{user_prompt}")
@@ -1013,6 +1013,9 @@ def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
         parts.append(f"成品目标尺寸 {pixel_note}，画幅比例 {ratio}；请直接生成完整成片")
     if r.extra:
         parts.append(r.extra)
+    parts.append("完成后必须在当前会话直接交付可播放、可下载的视频附件，不能仅用文字宣称已完成或提出后续制作方案；"
+                 "请在本次请求内完成交付，不询问是否继续；若无法完成，明确说明失败原因。"
+                 "如成品经过多段合成或分辨率放大，请如实说明，不能宣称为原生一次生成")
     return "，".join(parts)
 
 
@@ -1532,6 +1535,13 @@ async def images_edits(request: Request, _=Depends(auth)):
 
 
 # ------------------------- 生视频（异步任务） -------------------------
+def _video_generation_timeout(req: VideoRequest) -> int:
+    # Longer originals require more render time. This extends observation of one
+    # accepted generation; it never creates another generation on timeout.
+    adaptive = min(1800, max(1, req.duration or 6) * 40)
+    return req.timeout or max(CFG.video_timeout, adaptive)
+
+
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
 async def create_video(req: VideoRequest, idempotency_key: str | None = Header(default=None), _=Depends(auth)):
@@ -1539,7 +1549,7 @@ async def create_video(req: VideoRequest, idempotency_key: str | None = Header(d
         _prepare_reference_images, _video_references(req))
 
     prompt = build_video_prompt(req, _reference_kinds(ref_images))
-    timeout = req.timeout or CFG.video_timeout
+    timeout = _video_generation_timeout(req)
     if idempotency_key and len(idempotency_key) > 256:
         raise HTTPException(400, "Idempotency-Key too long")
     key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
@@ -1557,7 +1567,8 @@ async def create_video(req: VideoRequest, idempotency_key: str | None = Header(d
                             "progress": existing.get("progress", 0), "created_at": existing["created_at"]}
         task = store.create_task("video", req.prompt)
         store.update_task(task["id"], api_prompt=prompt,
-                          video_request_key=key_hash, video_request_hash=request_hash)
+                          video_request_key=key_hash, video_request_hash=request_hash,
+                          generation_timeout_seconds=timeout)
 
     store.update_task(task["id"], progress=10)
 

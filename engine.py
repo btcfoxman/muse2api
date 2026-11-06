@@ -1180,12 +1180,14 @@ class MuseEngine:
         deadline = time.time() + timeout
         t_start = time.time()
         stable_src, stable_n = "", 0
-        last_txt, txt_stable = "", 0
         refusal_last, refusal_stable = "", 0
         seen_stop = False
         previous_state = None
         last_activity = t_start
         progress_sent = 0
+        terminal_key = None
+        terminal_since = None
+        terminal_grace = 60.0
         while time.time() < deadline:
             if stop_event is not None and stop_event.is_set():
                 raise MuseGenerationError("客户端已断开连接，终止生成任务")
@@ -1242,15 +1244,22 @@ class MuseEngine:
             has_stop = False
             tail = ""
             try:
-                st_raw = self.page.js("""(function(){
+                st_raw = self.page.js(r"""(function(){
                     var bs=[].slice.call(document.querySelectorAll('div[class*="hatch-chat-groupable-bubble"]'))
                         .filter(function(b){return /hatch-agent-bubble-bg/.test(b.className||'');});
                     var lastTxt = bs.length ? (bs[bs.length-1].innerText||'').trim() : '';
                     var hasStop = !!(document.querySelector('[data-testid="hatch-composer-stop-button"]')
                         || document.querySelector('button[aria-label*="Stop" i]')
                         || document.querySelector('button[aria-label*="停止"]'));
+                    var rendering = [].slice.call(document.querySelectorAll(
+                        '[data-testid*="status-panel"] *, [data-testid="hatch-browser-task-banner-host"] *'))
+                        .some(function(e){
+                            if(e.children.length || !e.getClientRects().length) return false;
+                            var t=(e.innerText||'').trim();
+                            return /^(?:(?:Generating|Rendering|Creating|Processing)(?:\s+(?:video|image))?|Queued|In progress|(?:正在)?(?:生成|渲染|处理)(?:视频|图片|图像)?中?)(?:\.{3}|…)?$/i.test(t);
+                        });
                     var tail = document.body ? (document.body.innerText||'').slice(-1200) : '';
-                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, tail: tail,
+                    return JSON.stringify({cnt: bs.length, txt: lastTxt, stop: hasStop, rendering: rendering, tail: tail,
                         path: location.pathname || '', href: location.href || ''});
                 })()""")
                 st = json.loads(st_raw) if st_raw else {}
@@ -1260,9 +1269,10 @@ class MuseEngine:
             cur_cnt = int(st.get("cnt") or 0)
             cur_txt = st.get("txt") or ""
             has_stop = bool(st.get("stop"))
+            rendering = bool(st.get("rendering"))
             path = st.get("path") or ""
             seen_stop = seen_stop or has_stop
-            state = (cur_cnt, cur_txt, len(atts), has_stop, path)
+            state = (cur_cnt, cur_txt, len(atts), has_stop, rendering, path)
             if previous_state is None or state != previous_state:
                 last_activity = time.time()
                 previous_state = state
@@ -1289,7 +1299,13 @@ class MuseEngine:
             refusal_source = cur_txt if cur_cnt > base_agent_cnt else (
                 tail if seen_stop and not has_stop and elapsed > 20.0 else "")
             refusal = self._media_refusal_text(refusal_source, expect)
-            if refusal and not has_stop and len(atts) <= base_att_cnt:
+            matching_sources = (
+                (a.get("vSrc") or (a.get("src")
+                 if (a.get("src") or "").endswith((".mp4", ".webm", ".mov")) else ""))
+                if expect == "video" else a.get("src")
+                for a in matching_atts)
+            has_new_media = any(src and src not in baseline_sources for src in matching_sources)
+            if refusal and not has_stop and not rendering and not has_new_media:
                 if refusal == refusal_last:
                     refusal_stable += 1
                 else:
@@ -1299,22 +1315,21 @@ class MuseEngine:
             else:
                 refusal_last, refusal_stable = "", 0
 
-            if cur_cnt > base_agent_cnt and cur_txt and not has_stop and len(atts) <= base_att_cnt:
-                # Media-status text can precede a real attachment; do not fail on it.
-                is_media_report = self._media_status_pending(cur_txt)
-                if not is_media_report:
-                    if cur_txt == last_txt:
-                        txt_stable += 1
-                    else:
-                        last_txt, txt_stable = cur_txt, 0
-                    if txt_stable >= 15 and elapsed > 8.0:
-                        clean = self._clean_model_text(cur_txt)
-                        raise MuseModelRefusalError(
-                            f"模型未生成媒体，仅返回文本: {clean}")
-                else:
-                    txt_stable = 0
+            terminal_without_media = (
+                cur_cnt > base_agent_cnt and cur_txt and not has_stop
+                and not rendering and not has_new_media)
+            if terminal_without_media:
+                key = (cur_cnt, cur_txt)
+                if key != terminal_key:
+                    terminal_key, terminal_since = key, time.time()
+                elif time.time() - terminal_since >= terminal_grace:
+                    # Completion claims and follow-up choices are text, not a delivered file.
+                    # Stop/rendering activity resets this grace; fresh media wins above it.
+                    clean = self._clean_model_text(cur_txt)
+                    raise MuseModelRefusalError(
+                        f"模型已停止且 {int(terminal_grace)} 秒内未返回新媒体，仅返回文本: {clean}")
             else:
-                txt_stable = 0
+                terminal_key, terminal_since = None, None
 
             # Muse accepted the click but never created a thread. Requiring a completed
             # Stop-button lifecycle, an idle page, no messages/attachments and /thread/new
