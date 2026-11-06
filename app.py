@@ -55,7 +55,7 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
                     MuseModelRefusalError, RefImageSafetyError, reference_kind)
-from engine import MuseProxyError
+from engine import MuseProxyError, _sniff_mime
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context
 
@@ -1829,7 +1829,11 @@ def get_media(name: str):
     p = os.path.join(CFG.media_dir, name)
     if not os.path.isfile(p):
         raise HTTPException(404, "文件不存在")
-    return FileResponse(p)
+    with open(p, "rb") as media:
+        mime = _sniff_mime(media.read(64))
+    media_type = (mime if mime in REFERENCE_MIME_EXT and reference_kind(mime) in ("image", "video", "audio")
+                  else "application/octet-stream")
+    return FileResponse(p, media_type=media_type)
 
 
 # ------------------------- 管理：总览 -------------------------

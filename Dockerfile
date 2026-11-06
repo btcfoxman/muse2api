@@ -1,9 +1,5 @@
 FROM python:3.11-slim-bookworm
 
-ARG APP_GIT_SHA=unknown
-LABEL org.opencontainers.image.source="https://github.com/btcfoxman/muse2api" \
-      org.opencontainers.image.revision="${APP_GIT_SHA}"
-
 # 基础环境与 Chromium 安装
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -12,8 +8,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     MUSE2API_PORT=18610 \
     MUSE2API_CHROMIUM=/usr/bin/chromium \
     MUSE2API_CDP_PORT=19210 \
-    MUSE2API_PROFILE_ROOT=/app/data/chrome-profiles \
-    APP_GIT_SHA=${APP_GIT_SHA}
+    MUSE2API_PROFILE_ROOT=/app/data/chrome-profiles
 
 WORKDIR /app
 
@@ -41,6 +36,12 @@ COPY tools/ ./tools/
 
 # 创建持久化数据目录
 RUN mkdir -p /app/data/media /app/data/downloads /app/data/chrome-profiles
+
+# Commit metadata follows dependency layers so each revision can reuse them.
+ARG APP_GIT_SHA=unknown
+LABEL org.opencontainers.image.source="https://github.com/btcfoxman/muse2api" \
+      org.opencontainers.image.revision="${APP_GIT_SHA}"
+ENV APP_GIT_SHA=${APP_GIT_SHA}
 
 VOLUME ["/app/data"]
 
