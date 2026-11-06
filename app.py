@@ -43,6 +43,7 @@ import threading
 import time
 import uuid
 import zipfile
+from urllib.parse import urlsplit
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
@@ -1954,12 +1955,38 @@ async def responses_api(req: ResponsesRequest, _=Depends(auth)):
     return envelope("completed", text)
 
 
-@app.get("/v1/media/{name}")
-def get_media(name: str):
+@app.api_route("/v1/media/{name}", methods=["GET", "HEAD"])
+def get_media(name: str, request: Request = None):
     if "/" in name or "\\" in name or ".." in name:
         raise HTTPException(400, "非法文件名")
     p = os.path.join(CFG.media_dir, name)
-    if not os.path.isfile(p):
+    local_exists = os.path.isfile(p)
+    is_head = request is not None and request.method == "HEAD"
+    # A stable local URL may have been returned before storage recovered. GET
+    # follows the committed asset; HEAD stays local because GET signatures are
+    # method-bound and cannot safely authorize a HEAD request to S3.
+    if (not is_head or not local_exists) and RESULT_STORAGE.enabled():
+        try:
+            # A download must not wait behind an in-progress original upload.
+            asset = RESULT_DELIVERY.lookup(name, refresh=not is_head, blocking=False)
+            target = (asset or {}).get("url", "")
+            parsed = urlsplit(target)
+            if (not is_head and asset and asset.get("storage") and asset.get("storage_status") == "stored"
+                    and target != media_url(name) and parsed.scheme == "https" and parsed.hostname
+                    and not parsed.username and not parsed.password and not parsed.fragment
+                    and not any(ord(char) < 33 or ord(char) == 127 for char in target)):
+                return RedirectResponse(target, status_code=307, headers={"Cache-Control": "no-store"})
+            if is_head and asset and asset.get("storage_status") == "stored":
+                metadata = asset.get("storage") or {}
+                size = metadata.get("size_bytes")
+                if metadata.get("original_bytes") is True and type(size) is int and 0 < size <= 256 * 1024 * 1024:
+                    mime = asset.get("mime") or metadata.get("content_type")
+                    mime = mime if mime in REFERENCE_MIME_EXT else "application/octet-stream"
+                    return Response(media_type=mime, headers={"Content-Length": str(size),
+                                    "Accept-Ranges": "bytes", "Cache-Control": "no-store"})
+        except Exception as exc:
+            log.warning("Result URL lookup unavailable (%s)", type(exc).__name__)
+    if not local_exists:
         raise HTTPException(404, "文件不存在")
     with open(p, "rb") as media:
         mime = _sniff_mime(media.read(64))

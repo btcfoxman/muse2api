@@ -13,7 +13,7 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from result_delivery import ResultDelivery
+from result_delivery import ResultDelivery, storage_failure_facts
 from result_storage import ResultStorageError
 
 
@@ -117,6 +117,37 @@ class ResultDeliveryTest(unittest.TestCase):
         self.assertEqual(result["storage"], first["storage"])
         self.assertIn("storage_error", result)
         self.assertEqual(len(self.storage.calls), 1)
+        restarted = ResultDelivery(self.cfg, self.storage, self.local)
+        self.assertEqual(restarted.lookup(self.filename)["storage"], first["storage"])
+        self.assertIn("storage_failure", restarted.lookup(self.filename))
+        self.storage.fail = False
+        renewed = restarted.lookup(self.filename, refresh=True)
+        self.assertEqual(renewed["storage_status"], "stored")
+        self.assertNotIn("storage_failure", renewed)
+        self.assertEqual(len(self.storage.calls), 1)
+
+    def test_actual_storage_failure_stage_is_saved_without_raw_error(self):
+        error = ResultStorageError("s3-center presign HTTP 503")
+        with patch.object(self.storage, "store_original", side_effect=error), self.assertLogs("muse2api", level="WARNING") as logs:
+            result = self.delivery.store_original(self.result)
+        facts = result["storage_failure"]
+        self.assertEqual((facts["stage"], facts["code"], facts["http_status"]), ("presign", "HTTP_ERROR", 503))
+        self.assertEqual(facts["asset_sha256"], hashlib.sha256(self.filename.encode()).hexdigest())
+        self.assertNotIn(self.filename, "".join(logs.output))
+        saved = json.loads(Path(self.delivery.path).read_text(encoding="utf-8"))[self.filename]
+        self.assertEqual(saved["storage_failure"], facts)
+        self.assertEqual(self.file.read_bytes(), PNG)
+
+    def test_storage_diagnostics_allow_only_fixed_types_and_never_raw_request_data(self):
+        for message, expected in (("s3-center presign transport failure: ReadTimeout", "TRANSPORT_ERROR"),
+                                  ("s3-center presign response does not match object", "INVALID_RESPONSE"),
+                                  ("s3-center upload receipt does not match object", "IDENTITY_MISMATCH"),
+                                  ("https://user:PRIVATE@objects.example.test/a?signature=PRIVATE", "STORAGE_ERROR")):
+            with self.subTest(expected=expected), self.assertLogs("muse2api", level="WARNING") as logs:
+                facts = storage_failure_facts(ResultStorageError(message), self.filename)
+            self.assertEqual(facts["code"], expected)
+            self.assertNotIn("PRIVATE", json.dumps(facts) + "".join(logs.output))
+            self.assertNotIn("objects.example.test", json.dumps(facts) + "".join(logs.output))
 
     def test_simultaneous_historical_and_live_transfers_share_one_upload(self):
         barrier = threading.Barrier(5)
@@ -145,6 +176,10 @@ class ResultDeliveryTest(unittest.TestCase):
                 self.assertEqual(snapshot["storage_status"], "uploading")
                 self.assertEqual(snapshot["url"], self.local(self.filename))
                 self.assertFalse(transfer.done())
+                download = pool.submit(self.delivery.lookup, self.filename, refresh=True, blocking=False).result(timeout=2)
+                self.assertEqual(download["storage_status"], "uploading")
+                self.assertEqual(download["url"], self.local(self.filename))
+                self.assertFalse(transfer.done(), "public lookup must not wait for the original upload")
             finally:
                 release.set()
             self.assertEqual(transfer.result(timeout=3)["storage_status"], "stored")
@@ -154,6 +189,12 @@ class ResultDeliveryTest(unittest.TestCase):
         result = self.delivery.store_original(self.result)
         self.assertEqual(result["storage_status"], "disabled")
         self.assertEqual(result["url"], self.local(self.filename))
+        self.assertEqual(self.storage.calls, [])
+
+    def test_public_refresh_misses_do_not_allocate_persistent_file_locks(self):
+        for index in range(512):
+            self.assertIsNone(self.delivery.lookup("missing-" + str(index), refresh=True, blocking=False))
+        self.assertEqual(self.delivery._files, {})
         self.assertEqual(self.storage.calls, [])
 
     def test_filename_and_symlink_cannot_publish_an_unselected_file(self):

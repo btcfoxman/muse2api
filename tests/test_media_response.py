@@ -46,11 +46,11 @@ class MediaResponseTest(unittest.TestCase):
         cls.env.stop()
         cls.home.cleanup()
 
-    def request(self, name, headers=None, asgi_app=None):
+    def request(self, name, headers=None, asgi_app=None, method="GET"):
         async def send_request():
             path = "/v1/media/" + name
             scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
-                     "method": "GET", "scheme": "http", "path": path,
+                     "method": method, "scheme": "http", "path": path,
                      "raw_path": path.encode(), "query_string": b"", "root_path": "",
                      "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
                      "server": ("test", 80), "client": ("test", 1)}
@@ -126,6 +126,62 @@ class MediaResponseTest(unittest.TestCase):
                 self.assertEqual(headers["accept-ranges"], "bytes")
                 self.assertEqual(headers["content-range"], f"bytes 3-17/{len(data)}")
                 self.assertEqual(body, data[3:18])
+
+    def test_recovered_stored_asset_redirects_same_public_get_and_range_url(self):
+        asset = {"storage_status": "stored", "storage": {"original_bytes": True},
+                 "url": "https://objects.example.test/original.mp4?signature=fixture"}
+        with patch.object(self.app.RESULT_STORAGE, "enabled", return_value=True), \
+             patch.object(self.app.RESULT_DELIVERY, "lookup", return_value=asset) as lookup:
+            for headers in ({}, {"Range": "bytes=0-31"}):
+                status, response, body = self.request("generated.mp4", headers)
+                self.assertEqual(status, 307)
+                self.assertEqual(response["location"], asset["url"])
+                self.assertEqual(response["cache-control"], "no-store")
+                self.assertEqual(body, b"")
+            self.assertEqual(lookup.call_count, 2)
+            lookup.assert_called_with("generated.mp4", refresh=True, blocking=False)
+
+    def test_stored_delivery_survives_local_cache_removal_for_get_and_head(self):
+        asset = {"storage_status": "stored", "mime": "video/mp4",
+                 "storage": {"original_bytes": True, "size_bytes": 1234},
+                 "url": "https://objects.example.test/original.mp4?signature=fixture"}
+        with patch.object(self.app.RESULT_STORAGE, "enabled", return_value=True), \
+             patch.object(self.app.RESULT_DELIVERY, "lookup", return_value=asset) as lookup:
+            status, headers, body = self.request("cache-was-removed.mp4")
+            self.assertEqual(status, 307)
+            self.assertEqual(headers["location"], asset["url"])
+            status, headers, body = self.request("cache-was-removed.mp4", method="HEAD")
+            self.assertEqual(status, 200)
+            self.assertEqual(headers["content-length"], "1234")
+            self.assertEqual(headers["content-type"], "video/mp4")
+            self.assertNotIn("location", headers)
+            self.assertEqual(body, b"")
+            lookup.assert_called_with("cache-was-removed.mp4", refresh=False, blocking=False)
+
+    def test_head_never_redirects_to_a_get_signature_or_refreshes_storage(self):
+        with patch.object(self.app.RESULT_STORAGE, "enabled", return_value=True), \
+             patch.object(self.app.RESULT_DELIVERY, "lookup", side_effect=AssertionError("HEAD must not use GET signature")):
+            for request_headers, expected_status, size in (({}, 200, len(self.fixtures["generated.mp4"][0])),
+                                                           ({"Range": "bytes=3-17"}, 206, 15)):
+                status, headers, body = self.request("generated.mp4", request_headers, method="HEAD")
+                self.assertEqual(status, expected_status)
+                self.assertNotIn("location", headers)
+                self.assertEqual(int(headers["content-length"]), size)
+                self.assertEqual(body, b"")
+
+    def test_storage_outage_or_unsafe_url_preserves_original_range_delivery(self):
+        for asset in (None, {"storage_status": "failed"},
+                      {"storage_status": "stored", "storage": {"original_bytes": True}, "url": "http://objects.example.test/a"},
+                      {"storage_status": "stored", "storage": {"original_bytes": True}, "url": "https://user:secret@objects.example.test/a"}):
+            with self.subTest(asset=asset), patch.object(self.app.RESULT_STORAGE, "enabled", return_value=True), \
+                 patch.object(self.app.RESULT_DELIVERY, "lookup", return_value=asset):
+                status, headers, body = self.request("generated.mp4", {"Range": "bytes=3-17"})
+                self.assertEqual(status, 206)
+                self.assertNotIn("location", headers)
+                self.assertEqual(body, self.fixtures["generated.mp4"][0][3:18])
+        with patch.object(self.app.RESULT_STORAGE, "enabled", return_value=True), \
+             patch.object(self.app.RESULT_DELIVERY, "lookup", side_effect=RuntimeError("fixture")):
+            self.assertEqual(self.request("generated.mp4")[0], 200)
 
     def test_missing_and_unsafe_paths_remain_rejected_before_sniffing(self):
         with patch.object(self.app, "_sniff_mime") as sniff:
