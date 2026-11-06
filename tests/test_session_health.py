@@ -100,7 +100,7 @@ def check(root, home, observe):
             want = False if isinstance(error, app.MuseAuthError) else prior
             expect(a['ok'] is want, 'manual test misclassified account')
 
-    for body, want in [('loading workspace', 'MuseGenerationError'), ('Sign in', 'MuseAuthError')]:
+    for body, want in [('loading workspace', 'MusePageNotReadyError'), ('Sign in', 'MuseAuthError')]:
         page = SimpleNamespace(js=lambda script: body if 'innerText' in script else False,
                                send=lambda *a, **k: None, close=lambda: None)
         e = app.MuseEngine(SimpleNamespace(profile_dir=home, login_wait=0))

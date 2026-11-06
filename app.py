@@ -55,7 +55,7 @@ from admin_auth import AdminLogin, AdminLoginMiddleware, COOKIE_NAME, constant_t
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
-                    MuseModelRefusalError, RefImageSafetyError, reference_kind)
+                    MuseModelRefusalError, MusePageNotReadyError, RefImageSafetyError, reference_kind)
 from engine import MuseProxyError, _sniff_mime
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context
@@ -1185,6 +1185,8 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     reference_image: str | None = None,
                     reference_images: list[str] | None = None,
                     deadline=None) -> tuple[dict, str | None]:
+    if deadline is None:
+        deadline = time.monotonic() + max(1, timeout)
     remaining_wait = int(deadline - time.monotonic()) if deadline is not None else timeout
     preferred_id = getattr(engine, "current_acc_id", None)
     if kind == "video" and not account_id:
@@ -1238,13 +1240,33 @@ def _run_generation_locked(prompt: str, kind: str, timeout: int,
                     reference_image = refs[0]
                 elif len(refs) > 1:
                     engine_kwargs["reference_images"] = refs
-                res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
-                                      timeout=remaining, expires=cur_acc.get("cookies_exp"),
-                                      account_id=cur_acc["id"], on_progress=on_progress,
-                                      reference_image=reference_image, **engine_kwargs)
+                for preparation_attempt in range(2):
+                    remaining = int(deadline - time.monotonic())
+                    if remaining <= 0:
+                        raise MusePageNotReadyError("任务准备等待时限已到，停止重试")
+                    attempt_kwargs = dict(engine_kwargs)
+                    if preparation_attempt:
+                        # Keep this lease, identity and proxy snapshot. Only a
+                        # proved pre-submit preparation failure may retry here.
+                        attempt_kwargs["skip_session_renew"] = True
+                    try:
+                        res = engine.generate(cur_acc["cookies"], prompt, expect=kind,
+                                              timeout=remaining, expires=cur_acc.get("cookies_exp"),
+                                              account_id=cur_acc["id"], on_progress=on_progress,
+                                              reference_image=reference_image, **attempt_kwargs)
+                        break
+                    except MusePageNotReadyError:
+                        engine.close_current_page()
+                        if preparation_attempt or time.monotonic() >= deadline:
+                            raise
+                        log.warning("页面提交前未就绪，保留当前账号并仅重试一次新页面")
                 store.mark(cur_acc["id"], True, "")
                 _sync_cookies(cur_acc["id"])
                 return res, cur_acc["id"]
+            except MusePageNotReadyError:
+                # Exhausted pre-submit retries are terminal, not account/auth
+                # failures and not permission for another generation attempt.
+                raise
             except MuseAuthError as exc:
                 last_exc = exc
                 store.mark(cur_acc["id"], False, str(exc))

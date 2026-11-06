@@ -259,6 +259,10 @@ class MuseGenerationError(RuntimeError):
     pass
 
 
+class MusePageNotReadyError(MuseGenerationError):
+    """Composer preparation failed before any prompt submission was attempted."""
+
+
 class MuseProxyError(MuseGenerationError):
     """The account's configured proxy failed; this is not Cookie invalidation."""
 
@@ -788,7 +792,8 @@ class MuseEngine:
         except Exception:
             pass
 
-    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None):
+    def ensure_page(self, cookies: dict, expires: dict | None = None, account_id: str | None = None,
+                    *, skip_session_renew: bool = False):
         resolver = getattr(self, "proxy_resolver", None)
         local = self._ensure_local()
         # A lease snapshots routing; a concurrent config edit must never change its exit.
@@ -809,7 +814,7 @@ class MuseEngine:
             last_map = {}
             self._last_http_renew = last_map
         now_ts = time.time()
-        if not account_id or (now_ts - last_map.get(account_id, 0) > 600):
+        if not skip_session_renew and (not account_id or (now_ts - last_map.get(account_id, 0) > 600)):
             try:
                 renewed = self.renew_session_http(cookies, expires, wake_vm=True,
                                                   **({"proxy": proxy} if proxy else {}))
@@ -845,7 +850,7 @@ class MuseEngine:
         if re.search(r"log in|sign in|create an account|登录|use another account", body):
             raise MuseAuthError("会话已被 muse.ai 登出（可能被其它登录挤掉或触发风控），"
                                 "请用浏览器扩展重新导入 cookie")
-        raise MuseGenerationError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
+        raise MusePageNotReadyError("muse.ai 页面加载超时（未出现聊天输入框），请检查服务器网络后重试；未确认会话失效")
 
     def close_current_page(self):
         """显式释放当前线程所持有的页面和隔离上下文。"""
@@ -1844,9 +1849,12 @@ class MuseEngine:
                  timeout: int = 240, expires: dict | None = None, account_id: str | None = None,
                  on_progress=None, reference_image: str | None = None,
                  reference_images: list[str] | None = None,
-                 stop_event=None) -> dict:
+                 stop_event=None, *, skip_session_renew: bool = False) -> dict:
         deadline = time.monotonic() + timeout
-        self.ensure_page(cookies, expires, account_id=account_id)
+        if skip_session_renew:
+            self.ensure_page(cookies, expires, account_id=account_id, skip_session_renew=True)
+        else:
+            self.ensure_page(cookies, expires, account_id=account_id)
         self.reset_thread(for_chat=False)
         self._scroll_bottom()
         refs = list(reference_images or ([] if not reference_image else [reference_image]))
