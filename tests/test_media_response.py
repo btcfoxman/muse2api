@@ -46,7 +46,7 @@ class MediaResponseTest(unittest.TestCase):
         cls.env.stop()
         cls.home.cleanup()
 
-    def request(self, name, headers=None):
+    def request(self, name, headers=None, asgi_app=None):
         async def send_request():
             path = "/v1/media/" + name
             scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1",
@@ -55,19 +55,56 @@ class MediaResponseTest(unittest.TestCase):
                      "headers": [(k.lower().encode(), v.encode()) for k, v in (headers or {}).items()],
                      "server": ("test", 80), "client": ("test", 1)}
             messages = []
+            request_sent = False
+            response_completed = asyncio.Event()
 
             async def receive():
-                return {"type": "http.request", "body": b"", "more_body": False}
+                nonlocal request_sent
+                if not request_sent:
+                    request_sent = True
+                    return {"type": "http.request", "body": b"", "more_body": False}
+                await response_completed.wait()
+                return {"type": "http.disconnect"}
 
             async def send(message):
                 messages.append(message)
+                if message["type"] == "http.response.body" and not message.get("more_body", False):
+                    response_completed.set()
 
-            await self.app.app(scope, receive, send)
+            await (asgi_app or self.app.app)(scope, receive, send)
             start = next(m for m in messages if m["type"] == "http.response.start")
             response_headers = {k.decode().lower(): v.decode() for k, v in start["headers"]}
             return start["status"], response_headers, b"".join(m.get("body", b"") for m in messages)
 
         return asyncio.run(send_request())
+
+    def test_transport_waits_for_final_body_before_disconnect(self):
+        async def listening_app(scope, receive, send):
+            self.assertEqual((await receive())["type"], "http.request")
+
+            async def listen_for_disconnect():
+                # A framework may concurrently listen while streaming the response.
+                message = await receive()
+                self.assertEqual(message["type"], "http.disconnect", "request body must not be repeated")
+
+            listener = asyncio.create_task(listen_for_disconnect())
+            try:
+                await asyncio.sleep(0)
+                self.assertFalse(listener.done(), "disconnect must wait for the response")
+                await send({"type": "http.response.start", "status": 200, "headers": []})
+                await send({"type": "http.response.body", "body": b"first", "more_body": True})
+                await asyncio.sleep(0)
+                self.assertFalse(listener.done(), "partial response must not signal disconnect")
+                await send({"type": "http.response.body", "body": b"last", "more_body": False})
+                await asyncio.wait_for(listener, timeout=1)
+            finally:
+                if not listener.done():
+                    listener.cancel()
+                await asyncio.gather(listener, return_exceptions=True)
+
+        status, _headers, body = self.request("transport-fixture", asgi_app=listening_app)
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"firstlast")
 
     def test_public_delivery_uses_magic_without_system_mime_database(self):
         with patch("starlette.responses.guess_type", return_value=(None, None)):
@@ -102,4 +139,4 @@ class MediaResponseTest(unittest.TestCase):
 
 if __name__ == "__main__":
     with patch("requests.sessions.Session.request", side_effect=AssertionError("unexpected network")):
-        unittest.main()
+        unittest.main(verbosity=2)
