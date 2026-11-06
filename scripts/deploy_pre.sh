@@ -51,9 +51,25 @@ active_tasks() {
   python3 - "$DEPLOY_PATH/data/tasks.json" <<'PY'
 import json
 from pathlib import Path
+import subprocess
 import sys
 path = Path(sys.argv[1])
-tasks = json.loads(path.read_text(encoding='utf-8')) if path.exists() else {}
+try:
+    payload = path.read_text(encoding='utf-8')
+except FileNotFoundError:
+    payload = '{}'
+except PermissionError:
+    # Store's atomic task files may be root-owned 0600. Read without changing them.
+    try:
+        payload = subprocess.run(['sudo', '-n', 'cat', str(path)],
+                                 capture_output=True, text=True, encoding='utf-8',
+                                 timeout=5, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        raise SystemExit('Cannot safely read persisted task records') from None
+try:
+    tasks = json.loads(payload)
+except (ValueError, UnicodeError):
+    raise SystemExit('Cannot safely parse persisted task records') from None
 if not isinstance(tasks, dict) or any(not isinstance(t, dict) for t in tasks.values()):
     raise SystemExit('Cannot safely inspect persisted task records')
 terminal = {'completed', 'succeeded', 'success', 'done', 'failed', 'error',
