@@ -67,12 +67,14 @@ class StorageIntegrationTest(unittest.TestCase):
         self.path.write_bytes(PNG)
         self.result = {"path": str(self.path), "filename": self.name, "size": len(PNG), "kind": "image"}
 
-    def request(self, method, path, body=None, *, bearer=False, cookie=None, csrf=None, origin=None):
+    def request(self, method, path, body=None, *, bearer=False, cookie=None, csrf=None, origin=None, idempotency=None):
         async def invoke():
             data = json.dumps(body).encode() if body is not None else b""
             headers = [(b"host", b"test:18610"), (b"content-type", b"application/json")]
             if bearer:
                 headers.append((b"authorization", b"Bearer fixture-business-key"))
+            if idempotency:
+                headers.append((b"idempotency-key", idempotency.encode()))
             if cookie:
                 headers.append((b"cookie", cookie.encode()))
             if csrf:
@@ -154,7 +156,9 @@ class StorageIntegrationTest(unittest.TestCase):
         original = b"\x00\x00\x00\x14ftypisom\x00\x00\x00\x00isom\x00\x00\x00\x10mdatfixture!"
         self.path = self.path.with_suffix(".mp4")
         self.path.write_bytes(original)
-        result = {"path": str(self.path), "filename": self.path.name, "size": len(original), "kind": "video"}
+        result = {"path": str(self.path), "filename": self.path.name, "size": len(original), "kind": "video",
+                  "media_metadata": {"width": 1920, "height": 1080, "duration": 6.0, "measured_by": "ffprobe"},
+                  "media_metadata_status": "measured"}
         with patch.object(self.app, "_run_generation", return_value=(result, "fixture")) as generate:
             status, _, accepted = self.request("POST", "/v1/videos", {"prompt": "fixture", "duration": 4}, bearer=True)
             self.assertEqual(status, 200)
@@ -163,9 +167,39 @@ class StorageIntegrationTest(unittest.TestCase):
         self.assertEqual(task["url"], task["video"]["url"])
         self.assertEqual(task["url"], task["result"]["url"])
         self.assertEqual(task["result"]["bytes"], len(original))
+        self.assertEqual(task["result"]["media_metadata"], result["media_metadata"])
         self.assertTrue(task["result"]["storage"]["original_bytes"])
         self.assertEqual(self.path.read_bytes(), original)
         generate.assert_called_once()
+
+    def test_video_submission_idempotency_retains_original_generation(self):
+        original = b"\x00\x00\x00\x14ftypisom\x00\x00\x00\x00isom\x00\x00\x00\x10mdatfixture!"
+        self.path = self.path.with_suffix(".mp4")
+        self.path.write_bytes(original)
+        result = {"filename": self.path.name, "size": len(original), "kind": "video"}
+        payload = {"model": "muse-video", "prompt": "fixture", "duration": 6}
+        with patch.object(self.app, "_run_generation", return_value=(result, "fixture")) as generate:
+            status, _, first = self.request("POST", "/v1/videos", payload, bearer=True, idempotency="fixture-unique-video")
+            self.assertEqual(status, 200)
+            self.poll("videos", first["id"])
+            status, _, repeated = self.request("POST", "/v1/videos", payload, bearer=True, idempotency="fixture-unique-video")
+            self.assertEqual((status, repeated["id"]), (200, first["id"]))
+            status, _, _ = self.request("POST", "/v1/videos", {**payload, "duration": 30}, bearer=True, idempotency="fixture-unique-video")
+            self.assertEqual(status, 409)
+        generate.assert_called_once()
+
+    def test_video_prompt_preserves_requested_ratio_and_resolution(self):
+        for quality, short in (("720p", 720), ("1080p", 1080), ("4k", 2160)):
+            for ratio in ("16:9", "9:16", "1:1", "3:4", "4:3"):
+                with self.subTest(quality=quality, ratio=ratio):
+                    rw, rh = map(int, ratio.split(":"))
+                    expected = f"{round(short * rw / min(rw, rh))}x{round(short * rh / min(rw, rh))}"
+                    prompt = self.app.build_video_prompt(self.app.VideoRequest(prompt="fixture", aspect_ratio=ratio, resolution=quality, duration=30))
+                    self.assertIn(ratio, prompt)
+                    self.assertIn(expected, prompt)
+                    self.assertIn("30 秒", prompt)
+                    if quality != "720p":
+                        self.assertNotIn("720x1280", prompt)
 
     def test_storage_failure_remains_completed_and_does_not_regenerate(self):
         with patch.object(self.storage, "store_original", side_effect=self.failing_store), \

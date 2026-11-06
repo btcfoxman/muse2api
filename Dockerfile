@@ -15,6 +15,7 @@ WORKDIR /app
 # 安装 Chromium、中文字体与核心依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium \
+    ffmpeg \
     fonts-wqy-zenhei \
     fonts-freefont-ttf \
     procps \

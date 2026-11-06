@@ -47,6 +47,47 @@ MAX_REFERENCE_TOTAL_BYTES = 100 * 1024 * 1024
 MAX_REFERENCE_VIDEO_SECONDS = 120
 _MIB = 1024 * 1024
 
+
+def probe_generated_video(path: str) -> dict | None:
+    """Measure the downloaded original; missing metadata never retries generation."""
+    executable = shutil.which("ffprobe")
+    if not executable or not os.path.isfile(path):
+        return None
+    try:
+        completed = subprocess.run(
+            [executable, "-v", "error", "-protocol_whitelist", "file,pipe",
+             "-select_streams", "v:0", "-show_entries",
+             "stream=width,height,duration:format=duration", "-of", "json",
+             os.path.abspath(path)],
+            capture_output=True, check=False, timeout=20, shell=False,
+        )
+        if completed.returncode != 0 or len(completed.stdout) > 1024 * 1024:
+            return None
+        document = json.loads(completed.stdout)
+        streams = document.get("streams")
+        if not isinstance(streams, list) or not streams or not isinstance(streams[0], dict):
+            return None
+        stream = streams[0]
+        width, height = stream.get("width"), stream.get("height")
+        if (type(width) is not int or type(height) is not int
+                or width <= 0 or height <= 0):
+            return None
+        duration = None
+        for value in (stream.get("duration"), (document.get("format") or {}).get("duration")):
+            try:
+                seconds = float(value)
+            except (TypeError, ValueError, OverflowError):
+                continue
+            if not isinstance(value, bool) and math.isfinite(seconds) and seconds > 0:
+                duration = seconds
+                break
+        if duration is None:
+            return None
+        return {"width": width, "height": height, "duration": duration,
+                "measured_by": "ffprobe"}
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError, AttributeError):
+        return None
+
 # 允许上传到 muse 输入框的素材类型 -> 落盘扩展名。
 # 图片/视频/文档取自 muse 前端白名单；音频不在白名单里，但输入框接受，
 # 且实测模型能读出 wav 的内容，所以一并放开。
@@ -1851,10 +1892,14 @@ class MuseEngine:
                 kind = "video" if ext in (".mp4", ".webm", ".mov") else "image"
                 if expect == "video" and kind != "video":
                     raise MuseGenerationError(f"期望生成视频，但提取成品类型为图片 ({ext})，拒绝以图片冒充视频交付")
-                return {"path": dst, "filename": name, "size": len(data), "ext": ext, "mime": mime,
-                        "kind": kind,
-                        "via": "blob", "attachment": att.get("tid"),
-                        "w": att.get("w"), "h": att.get("h")}
+                result = {"path": dst, "filename": name, "size": len(data), "ext": ext, "mime": mime,
+                          "kind": kind,
+                          "via": "blob", "attachment": att.get("tid"),
+                          "w": att.get("w"), "h": att.get("h")}
+                if kind == "video":
+                    result["media_metadata"] = probe_generated_video(dst)
+                    result["media_metadata_status"] = "measured" if result["media_metadata"] else "unavailable"
+                return result
 
             path = self._download_fallback(selected_src)
             if not path:
@@ -1874,10 +1919,14 @@ class MuseEngine:
             kind = "video" if ext in (".mp4", ".webm", ".mov") else "image"
             if expect == "video" and kind != "video":
                 raise MuseGenerationError(f"期望生成视频，但下载成品类型为图片 ({ext})，拒绝以图片冒充视频交付")
-            return {"path": dst, "filename": name, "size": os.path.getsize(dst), "ext": ext, "mime": "",
-                    "kind": kind,
-                    "via": "download", "attachment": att.get("tid"),
-                    "w": att.get("w"), "h": att.get("h")}
+            result = {"path": dst, "filename": name, "size": os.path.getsize(dst), "ext": ext, "mime": "",
+                      "kind": kind,
+                      "via": "download", "attachment": att.get("tid"),
+                      "w": att.get("w"), "h": att.get("h")}
+            if kind == "video":
+                result["media_metadata"] = probe_generated_video(dst)
+                result["media_metadata_status"] = "measured" if result["media_metadata"] else "unavailable"
+            return result
         raise MuseGenerationError("页面只返回了本次上传的参考素材，未出现新的生成结果")
 
     @staticmethod

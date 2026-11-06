@@ -966,19 +966,41 @@ def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
             "必须严格以我当前刚刚上传并附带在此处的这张图片为起始帧）")
 
     gen_word = "图生视频" if all(k == "image" for k in kinds) else "视频"
-    is_vertical = any(k in ar or k in sz for k in ("9:16", "9/16", "portrait", "竖屏", "720x1280", "1080x1920"))
+    ratio = ar.replace("/", ":")
+    if not ratio:
+        ratio = sz.replace("/", ":")
+    aliases = {"portrait": "9:16", "竖屏": "9:16", "landscape": "16:9", "横屏": "16:9"}
+    ratio = aliases.get(ratio, ratio)
+    dimensions = re.fullmatch(r"(\d+)[x×](\d+)", ratio)
+    if dimensions:
+        from math import gcd
+        w, h = map(int, dimensions.groups())
+        divisor = gcd(w, h)
+        ratio = f"{w // divisor}:{h // divisor}" if divisor else ""
+    ratio = ratio if ratio in {"9:16", "16:9", "1:1", "3:4", "4:3"} else ""
+    is_vertical = ratio == "9:16"
+    quality = str(r.resolution or "720p").lower()
+    short = {"720p": 720, "1080p": 1080, "4k": 2160}.get(quality)
+    pixel_note = ""
+    if ratio and short:
+        rw, rh = map(int, ratio.split(":"))
+        scale = short / min(rw, rh)
+        pixel_note = f"{round(rw * scale)}x{round(rh * scale)}"
 
     parts = []
     if is_vertical:
         if has_ref:
-            parts.append(f"{reference_instruction}：生成一个严格9:16竖屏手机满屏的动态{gen_word}（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严禁生成横屏或黑边，时长严格为 {dur} 秒）：{user_prompt}")
+            parts.append(f"{reference_instruction}：生成一个严格9:16竖屏手机满屏的动态{gen_word}（9:16 vertical portrait video，{pixel_note}，高大于宽的手机全屏竖版画面，严禁生成横屏或黑边，时长严格为 {dur} 秒）：{user_prompt}")
         else:
-            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个严格9:16竖屏手机满屏视频（9:16 vertical portrait video，720x1280，高大于宽的手机全屏竖版画面，严禁生成横屏或带有左右黑边，保持垂直构图，时长严格为 {dur} 秒）：{user_prompt}")
-    elif any(k in ar or k in sz for k in ("16:9", "16/9", "landscape", "横屏", "1280x720", "1920x1080")):
+            parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个严格9:16竖屏手机满屏视频（9:16 vertical portrait video，{pixel_note}，高大于宽的手机全屏竖版画面，严禁生成横屏或带有左右黑边，保持垂直构图，时长严格为 {dur} 秒）：{user_prompt}")
+    elif ratio == "16:9":
         if has_ref:
             parts.append(f"{reference_instruction}：生成一个16:9宽屏横屏{gen_word}（16:9 widescreen landscape video，时长严格为 {dur} 秒）：{user_prompt}")
         else:
             parts.append(f"全新文生视频创作（纯文本全新生成，严禁参考任何历史图片或上下文）：生成一个16:9横屏宽屏视频（16:9 widescreen landscape video，时长严格为 {dur} 秒）：{user_prompt}")
+    elif ratio:
+        lead = reference_instruction if has_ref else "全新文生视频创作（只使用本次提示词，严禁参考任何历史素材）"
+        parts.append(f"{lead}：生成一个严格 {ratio} 画幅的视频（{pixel_note}，时长严格为 {dur} 秒，完整动态画面，无黑边，无重复片段或拼接）：{user_prompt}")
     else:
         if has_ref:
             parts.append(f"{reference_instruction}：生成动态{gen_word}（时长严格为 {dur} 秒）：{user_prompt}")
@@ -987,6 +1009,8 @@ def build_video_prompt(r: VideoRequest, kinds: list[str] | None = None) -> str:
 
     if r.resolution:
         parts.append(f"画质规格：{r.resolution}")
+    if ratio and pixel_note:
+        parts.append(f"成品目标尺寸 {pixel_note}，画幅比例 {ratio}；请直接生成完整成片")
     if r.extra:
         parts.append(r.extra)
     return "，".join(parts)
@@ -1011,11 +1035,12 @@ def _deliver_result(res: dict) -> dict:
     """Storage failures must never enter generation/account retries."""
     local = {"filename": res["filename"], "size": res.get("size") or res.get("bytes") or 0,
              "kind": res.get("kind") or "image"}
+    metadata = {k: res[k] for k in ("media_metadata", "media_metadata_status") if k in res}
     try:
-        return RESULT_DELIVERY.store_original(local)
+        return {**RESULT_DELIVERY.store_original(local), **metadata}
     except Exception as exc:  # A saved original remains a successful generation.
         log.warning("Result storage unavailable (%s); original retained", type(exc).__name__)
-        return {**local, "url": media_url(local["filename"]), "storage_status": "failed",
+        return {**local, **metadata, "url": media_url(local["filename"]), "storage_status": "failed",
                 "storage_error": "S3 结果转存暂时失败，已保留原始成品，可单独重试转存~"}
 
 
@@ -1509,14 +1534,30 @@ async def images_edits(request: Request, _=Depends(auth)):
 # ------------------------- 生视频（异步任务） -------------------------
 @app.post("/v1/videos")
 @app.post("/v1/videos/generations")
-async def create_video(req: VideoRequest, _=Depends(auth)):
+async def create_video(req: VideoRequest, idempotency_key: str | None = Header(default=None), _=Depends(auth)):
     ref_images = await asyncio.to_thread(
         _prepare_reference_images, _video_references(req))
 
     prompt = build_video_prompt(req, _reference_kinds(ref_images))
     timeout = req.timeout or CFG.video_timeout
-    task = store.create_task("video", req.prompt)
-    store.update_task(task["id"], api_prompt=prompt)
+    if idempotency_key and len(idempotency_key) > 256:
+        raise HTTPException(400, "Idempotency-Key too long")
+    key_hash = hashlib.sha256(idempotency_key.encode()).hexdigest() if idempotency_key else None
+    request_hash = hashlib.sha256(json.dumps(
+        {"request": req.model_dump(), "references": ref_images},
+        sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    with IMAGE_TASK_LOCK:
+        if key_hash:
+            for existing in list(store.tasks.values()):
+                if existing.get("video_request_key") == key_hash:
+                    if existing.get("video_request_hash") != request_hash:
+                        raise HTTPException(409, "Idempotency-Key reused with different request")
+                    return {"id": existing["id"], "task_id": existing["id"],
+                            "object": "video.task", "status": existing["status"],
+                            "progress": existing.get("progress", 0), "created_at": existing["created_at"]}
+        task = store.create_task("video", req.prompt)
+        store.update_task(task["id"], api_prompt=prompt,
+                          video_request_key=key_hash, video_request_hash=request_hash)
 
     store.update_task(task["id"], progress=10)
 
@@ -1531,7 +1572,7 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
                                           reference_images=ref_images, on_acquired=_on_acquired)
             store.update_task(task["id"], progress=95, account=acc_id,
-                              result={**{k: res[k] for k in ("filename", "size", "kind")},
+                              result={**{k: res[k] for k in ("filename", "size", "kind", "media_metadata", "media_metadata_status") if k in res},
                                       "url": media_url(res["filename"])})
             res = _deliver_result(res)
             vurl = res["url"]

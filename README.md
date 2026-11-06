@@ -68,6 +68,8 @@
 
 `GET/POST /admin/result-storage` 读取或保存配置，`POST /admin/result-storage/transfer` 使用 `{"task_id":"task_..."}` 或 `{"filename":"...webp"}` 转存已有成品。它们遵循管理端登录和 CSRF 校验，不接受单独使用业务 API Key 管理配置。删除本地媒体或任务记录不会删除 S3 对象。
 
+视频请求的时长、分辨率和画幅会写入提示词，属于生成目标；不把请求值当作实际成品规格。支持在提示词中明确表达 `9:16/16:9/1:1/3:4/4:3` 和 `720p/1080p/4k`。镜像内通过 ffprobe 测量原始成品，查询结果的 `result.media_metadata` 返回实测 `width/height/duration`；无法测量时标为 `media_metadata_status=unavailable`。视频提交支持 `Idempotency-Key`，相同键和请求复用原任务，不重复生成；相同键但不同请求返回 409。
+
 ### 3.5 pre：GitHub Actions 构建与部署
 
 源码仓库为 `btcfoxman/muse2api`。推送 `pre` 分支或手动运行 `.github/workflows/deploy-test.yml`：先在 GitHub 托管的 `ubuntu-latest` runner 构建镜像，在同一个候选镜像中执行隔离的 Python 回归、Chromium 与 HTTP 健康检查，并在托管 runner 执行 Node 前端回归；全部通过后，才推送 `ghcr.io/btcfoxman/muse2api:<commit-sha>` 和 `:pre`。部署使用不可变的 commit SHA 标签。
