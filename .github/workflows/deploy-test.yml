@@ -21,6 +21,7 @@ env:
   DEPLOY_SERVICE: muse2api
   MUSE2API_HOSTNAME: muse2api.aiid.edu.kg
   MUSE2API_ORIGIN: http://127.0.0.1:18610
+  MUSE2API_LAN_ORIGIN: http://192.168.3.5:18610
   CLOUDFLARED_CONFIG: /etc/cloudflared/config.yml
 
 jobs:
@@ -100,7 +101,12 @@ jobs:
           for attempt in $(seq 1 30); do
             if curl -fsS --max-time 10 "https://${MUSE2API_HOSTNAME}/healthz" >/dev/null; then
               status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "https://${MUSE2API_HOSTNAME}/v1/models")"
-              if [ "$status" = 401 ]; then exit 0; fi
+              admin_status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "https://${MUSE2API_HOSTNAME}/admin")"
+              account_status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "https://${MUSE2API_HOSTNAME}/admin/accounts")"
+              if [ "$status" = 401 ] && [[ "$admin_status" =~ ^30[237]$ ]] && [ "$account_status" = 401 ]; then
+                curl -fsS --max-time 10 "${MUSE2API_LAN_ORIGIN}/healthz" >/dev/null
+                exit 0
+              fi
             fi
             sleep 5
           done

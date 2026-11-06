@@ -21,6 +21,9 @@ for line in path.read_text(encoding='utf-8').splitlines():
 key = values.get('MUSE2API_KEY', '')
 if not key or 'your_secret' in key or key.startswith('replace-'):
     raise SystemExit('Set a private MUSE2API_KEY before deployment')
+password = values.get('MUSE2API_ADMIN_PASSWORD', '')
+if not password or password.startswith('replace-'):
+    raise SystemExit('Set a private MUSE2API_ADMIN_PASSWORD before deployment')
 PY
 
 release="$DEPLOY_PATH/.releases/$(date -u +%Y%m%dT%H%M%SZ)-${IMAGE_TAG:0:12}"

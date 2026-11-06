@@ -47,10 +47,11 @@ import zipfile
 from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, HTMLResponse, JSONResponse,
-                               Response, StreamingResponse)
+                               RedirectResponse, Response, StreamingResponse)
 from pydantic import BaseModel, Field, SecretStr, field_validator
 
 from config import CFG
+from admin_auth import AdminLogin, AdminLoginMiddleware, COOKIE_NAME, constant_time_equal, private_error
 from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
                     MAX_REFERENCE_IMAGES, MAX_REFERENCE_TOTAL_BYTES,
                     REFERENCE_MIME_EXT, MuseAuthError, MuseEngine, MuseGenerationError,
@@ -73,9 +74,8 @@ app = FastAPI(title="muse2api", version="1.6.6")
 # Cookie 助手脚本从 muse.ai 页面发起导入请求，需要放行该来源；
 # 浏览器扩展从 chrome-extension:// 发起，也一并放行。
 #
-# 这里直接放行所有来源：本服务用 Bearer Key 鉴权、不依赖 Cookie，
-# 放行来源不会带来越权风险；反之如果把来源限死，浏览器端的智能体
-# （Open WebUI / LobeChat / 各种 Web 客户端）会被 CORS 拦住用不了。
+# 业务 API 保持 Bearer Key 跨域兼容，不开放跨域 Cookie 凭据。
+# 管理会话由独立中间件检查同源与 CSRF，不依赖这份通配 CORS 设置。
 _origins = [o.strip() for o in (CFG.cors_origins or "").split(",") if o.strip()]
 from fastapi.middleware.cors import CORSMiddleware  # noqa: E402
 
@@ -85,6 +85,9 @@ app.add_middleware(CORSMiddleware,
                    allow_headers=["*"],
                    expose_headers=["*"],
                    max_age=600)
+
+ADMIN_LOGIN = AdminLogin(lambda: CFG)
+app.add_middleware(AdminLoginMiddleware, login=ADMIN_LOGIN)
 
 store = Store(CFG)
 engine = MuseEngine(CFG)
@@ -319,14 +322,16 @@ def resolve_model(name: str | None, default: str = "muse-image") -> str:
 
 
 # ------------------------- 鉴权 -------------------------
-def auth(authorization: str | None = Header(default=None)):
+def auth(authorization: str | None = Header(default=None), request: Request = None):
+    if request is not None and request.scope.get("muse_admin_session") is not None:
+        return True
     if not CFG.api_key:
         return True
-    if not authorization or not authorization.lower().startswith("bearer "):
+    if not isinstance(authorization, str) or not authorization.lower().startswith("bearer "):
         raise HTTPException(401, "缺少 Authorization: Bearer <key>")
     parts = authorization.split(None, 1)
     token = parts[1].strip() if len(parts) > 1 else ""
-    if not token or token != CFG.api_key:
+    if not token or not constant_time_equal(token, CFG.api_key):
         raise HTTPException(401, "API key 无效")
     return True
 
@@ -1206,6 +1211,8 @@ def healthz():
 @app.get("/readyz")
 def readyz():
     accs = [a for a in store.list_accounts() if a.get("enabled", True)]
+    if ADMIN_LOGIN.enabled:
+        return {"status": "ready" if accs else "no_account"}
     return {"status": "ready" if accs else "no_account",
             "accounts": len(accs),
             "browser_running": bool(engine.proc and engine.proc.poll() is None)}
@@ -2309,14 +2316,51 @@ def _admin_html() -> str:
     p = os.path.join(BASE_DIR, "admin.html")
     try:
         with open(p, encoding="utf-8") as f:
-            return f.read().replace("__MANAGED_DEPLOYMENT__",
-                                    "true" if CFG.managed_deployment else "false")
+            return (f.read().replace("__MANAGED_DEPLOYMENT__",
+                                     "true" if CFG.managed_deployment else "false")
+                    .replace("__ADMIN_LOGIN_REQUIRED__", "true" if ADMIN_LOGIN.enabled else "false"))
     except OSError:
         return ("<!doctype html><meta charset=utf-8><body style='background:#0b0f19;"
                 "color:#e6e8ee;font-family:system-ui;padding:40px'>"
                 "<h2>muse2api</h2><p>管理页面文件 admin.html 缺失。</p>"
                 "<p>接口可用：<code>/v1/images/generations</code>、"
                 "<code>/v1/videos</code></p></body>")
+
+
+@app.get("/admin/login", response_class=HTMLResponse)
+def admin_login_page(request: Request):
+    if not ADMIN_LOGIN.enabled or ADMIN_LOGIN.session(request):
+        return RedirectResponse("/admin", status_code=303)
+    try:
+        with open(os.path.join(BASE_DIR, "login.html"), encoding="utf-8") as page:
+            return HTMLResponse(page.read())
+    except OSError:
+        return HTMLResponse("<!doctype html><meta charset=utf-8><h1>管理登录</h1><p>登录页面暂不可用。</p>",
+                            status_code=503)
+
+
+@app.post("/admin/login")
+async def admin_login(request: Request):
+    return await ADMIN_LOGIN.login(request)
+
+
+@app.get("/admin/session")
+def admin_session(request: Request):
+    if not ADMIN_LOGIN.enabled:
+        return {"authenticated": False, "enabled": False, "csrf_token": ""}
+    session = request.scope.get("muse_admin_session")
+    if session is None:
+        return private_error(401, "请先登录管理端")
+    return {"authenticated": True, "csrf_token": session.csrf_token}
+
+
+@app.post("/admin/logout")
+def admin_logout(request: Request):
+    ADMIN_LOGIN.revoke(request)
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(COOKIE_NAME, path="/", secure=ADMIN_LOGIN.secure_cookie(request),
+                           httponly=True, samesite="strict")
+    return response
 
 
 @app.get("/", response_class=HTMLResponse)

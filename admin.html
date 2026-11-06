@@ -197,9 +197,22 @@
   body[data-managed-deployment="true"] [data-repo-write] { display:none !important; }
   #managedDeploymentNotice { display:none; }
   body[data-managed-deployment="true"] #managedDeploymentNotice { display:block; }
+  .admin-session-control{display:none;align-items:center;gap:9px}
+  .admin-session-label{font-size:12px;color:var(--ok);white-space:nowrap}
+  .session-gate{display:none;max-width:1236px;margin:22px auto;padding:18px 22px;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);align-items:center;justify-content:space-between;gap:16px;color:var(--muted)}
+  .session-gate p{margin:0}
+  body[data-admin-login-required="true"] #keyBox,
+  body[data-admin-login-required="true"] #authBanner{display:none !important}
+  body[data-admin-login-required="true"] .admin-session-control{display:inline-flex}
+  body[data-admin-login-required="true"]:not([data-admin-session-ready="true"]) main{visibility:hidden}
+  body[data-admin-login-required="true"]:not([data-admin-session-ready="true"]) .session-gate{display:flex}
+  .admin-login-only{display:none}
+  body[data-admin-login-required="true"] .admin-login-only{display:revert}
+  body[data-admin-login-required="true"] .legacy-admin-only{display:none !important}
+  @media(max-width:600px){.session-gate{margin:16px 22px;padding:16px;align-items:flex-start;flex-direction:column}.admin-session-control{margin-left:auto}}
 </style>
 </head>
-<body data-managed-deployment="__MANAGED_DEPLOYMENT__">
+<body data-managed-deployment="__MANAGED_DEPLOYMENT__" data-admin-login-required="__ADMIN_LOGIN_REQUIRED__">
 
 <header>
   <div class="hwrap">
@@ -226,6 +239,10 @@
         <input id="key" type="password" placeholder="粘贴 m2a_ 开头的密钥" autocomplete="off">
         <button class="ghost mini" onclick="saveKey()">保存</button>
       </span>
+      <span class="admin-session-control">
+        <span class="admin-session-label" id="adminSessionLabel">已登录</span>
+        <button type="button" class="ghost mini" id="logoutButton" onclick="logoutAdmin()">退出登录</button>
+      </span>
       <select id="langSel" class="langsel" data-no-i18n onchange="setLang(this.value)" title="Language / 语言">
         <option value="zh">中文</option>
         <option value="en">English</option>
@@ -233,6 +250,11 @@
     </div>
   </div>
 </header>
+
+<section class="session-gate" id="sessionGate" aria-live="polite">
+  <p id="sessionGateMessage">正在确认登录状态…</p>
+  <button type="button" class="ghost mini" id="sessionRetry" onclick="initializeAdmin()" hidden>重新连接</button>
+</section>
 
 <main>
   <!-- 实时新版本更新通知横幅（当官方仓库有新提交/新版本时自动向所有已部署用户弹出） -->
@@ -380,7 +402,11 @@
 
   <!-- ==================== 获取 Cookie ==================== -->
   <section class="tab" id="tab-cookie">
-    <div class="card" style="border-color:rgba(52,211,153,.45)">
+    <div class="card admin-login-only">
+      <h3>导入账号</h3>
+      <p class="hint" style="margin-bottom:0">按下方步骤复制已登录账号的 Cookie，再在本页粘贴导入。管理登录模式下，账号修改需在已登录的管理台中完成；API Key 用于业务接口接入。</p>
+    </div>
+    <div class="card legacy-admin-only" style="border-color:rgba(52,211,153,.45)">
       <h3>方式一：浏览器扩展 <span class="tag">推荐 · 零命令行 · 全平台</span></h3>
       <div class="hint" data-i18n="ext-why-hint">
         用一个浏览器小扩展，把你<b>自己电脑上已经登录好的 muse.ai 登录态</b>同步过来。
@@ -449,7 +475,7 @@
     </div>
 
     <div class="card">
-      <h3>方式二：手动复制 <span class="tag">零安装 · 兜底</span></h3>
+      <h3><span class="legacy-admin-only">方式二：手动复制</span><span class="admin-login-only">复制已登录账号的 Cookie</span> <span class="tag">零安装</span></h3>
       <div class="hint" data-i18n="manual-copy-hint">
         不想装扩展的话，可以手动把 cookie 串抠出来。关键是用
         <b>「网络」面板的请求标头</b>，而不是 Console —— 请求头里的
@@ -463,7 +489,7 @@
         <li>右侧找到 <b>标头 / Headers</b> → 往下滚到 <b>请求标头 / Request Headers</b></li>
         <li>找到以 <code>cookie:</code> 开头的那一行，<b>把冒号后面的整串复制</b>
             （从 <code>hatch_sess=</code> 开始，一直到行尾）</li>
-        <li>粘到下面「方式三」的输入框里，点导入</li>
+        <li>粘到下面的输入框里，点「导入账号」</li>
       </ol>
       <div class="hint" style="margin-top:10px;color:var(--warn)" data-i18n="manual-copy-warn">
         注意：是<b>请求标头</b>里的 <code>cookie:</code>，不是「响应标头」。
@@ -472,7 +498,7 @@
     </div>
 
     <div class="card">
-      <h3>方式三：粘贴导入 / 本机脚本 <span class="tag">进阶</span></h3>
+      <h3><span class="legacy-admin-only">方式三：粘贴导入 / 本机脚本</span><span class="admin-login-only">粘贴导入账号</span></h3>
       <div class="hint">已经拿到 cookie 串的话，直接粘在这里导入（方式二手动复制的串也粘这里）。</div>
       <div class="row" style="margin-top:10px">
         <div style="max-width:230px">
@@ -488,11 +514,11 @@
         <button class="primary-lg" onclick="addAccount(true)">导入账号</button>
       </div>
 
-      <div class="hint" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)" data-i18n="cli-script-hint">
+      <div class="hint legacy-admin-only" style="margin-top:18px;padding-top:14px;border-top:1px solid var(--line)" data-i18n="cli-script-hint">
         如果你习惯命令行、或者想用独立浏览器登录（不碰日常浏览器），也可以用这个脚本。
         它只用 Python 标准库，<b>不需要 pip 安装任何东西</b>。
       </div>
-      <div class="row" style="margin-top:10px">
+      <div class="row legacy-admin-only" style="margin-top:10px">
         <div style="flex:2">
           <label>① 下载脚本</label>
           <div class="copyline">
@@ -505,7 +531,7 @@
           <pre class="code" id="cmdBox"><span class="cp" onclick="copyCmd()">复制</span><span id="cmdText">正在生成命令…</span></pre>
         </div>
       </div>
-      <div class="hint" style="margin-top:8px">
+      <div class="hint legacy-admin-only" style="margin-top:8px">
         ③ 在弹出的浏览器窗口里登录 muse.ai → 脚本自动抓取并上传 → 自动关窗。
       </div>
     </div>
@@ -697,10 +723,13 @@ t = requests.post(<span class="s">"BASE/v1/videos"</span>, json={<span class="s"
       </table></div>
 
       <h4>7. 鉴权</h4>
-      <div class="hint" style="margin:0" data-i18n="auth-hint">
+      <div class="hint legacy-admin-only" style="margin:0" data-i18n="auth-hint">
         除 <code>/healthz</code>、<code>/readyz</code>、<code>/v1/media/*</code> 外，其余接口均需
         <code>Authorization: Bearer &lt;API Key&gt;</code>。API Key 在服务器
         <code>/opt/muse2api/.env</code> 的 <code>MUSE2API_KEY</code> 中配置。
+      </div>
+      <div class="hint admin-login-only" style="margin:0">
+        管理页面和管理接口使用管理密码登录后的会话；外部客户端调用 <code>/v1</code> 业务接口时，使用 <code>Authorization: Bearer &lt;API Key&gt;</code>。API Key 不能替代管理登录。
       </div>
 
       <h4>8. 接入各类客户端 / 智能体</h4>
@@ -804,6 +833,13 @@ function setLang(v){
 }
 /* 整句：中文 → 英文 */
 const I18N_EN = {
+  "已登录": "Signed in",
+  "退出登录": "Sign out",
+  "登录已失效": "Session expired",
+  "正在确认登录状态…": "Checking your session…",
+  "重新连接": "Reconnect",
+  "暂时无法确认登录状态，请重新连接。": "Unable to verify your session. Please reconnect.",
+  "退出登录失败，请稍后重试。": "Could not sign out. Please try again.",
   "取消": "Cancel",
   "http://proxy.example.com:8080 或 socks5://proxy.example.com:1080": "http://proxy.example.com:8080 or socks5://proxy.example.com:1080",
   "请先保存该账号的代理": "Save a proxy for this account first",
@@ -1413,8 +1449,22 @@ if (LANG === 'en') {
 
 /* ================= 基础 ================= */
 const $ = id => document.getElementById(id);
+const ADMIN_LOGIN_REQUIRED = document.body.dataset.adminLoginRequired === 'true';
+let ADMIN_CSRF = '';
+let adminSessionReady = !ADMIN_LOGIN_REQUIRED;
+let adminSessionLoading = false;
 const KEY_STORE = 'muse2api_key';
-let KEY = localStorage.getItem(KEY_STORE) || new URLSearchParams(location.search).get('key') || '';
+let KEY = '';
+if (ADMIN_LOGIN_REQUIRED) {
+  try { localStorage.removeItem(KEY_STORE); } catch(e) {}
+  const cleanLocation = new URL(location.href);
+  if (cleanLocation.searchParams.has('key')) {
+    cleanLocation.searchParams.delete('key');
+    history.replaceState(null, '', cleanLocation.pathname + cleanLocation.search + cleanLocation.hash);
+  }
+} else {
+  KEY = localStorage.getItem(KEY_STORE) || new URLSearchParams(location.search).get('key') || '';
+}
 $('key').value = KEY;
 $('dBase').textContent = location.origin + '/v1';
 
@@ -1423,6 +1473,10 @@ let authOK = null;
 function setAuth(ok){
   if (authOK === ok) return;
   authOK = ok;
+  if (ADMIN_LOGIN_REQUIRED) {
+    $('adminSessionLabel').textContent = ok ? '已登录' : '登录已失效';
+    return;
+  }
   $('authBanner').classList.toggle('show', !ok);
   $('keyBox').classList.toggle('ok', ok);
   $('keyBox').classList.toggle('miss', !ok);
@@ -1430,6 +1484,7 @@ function setAuth(ok){
 }
 
 function saveKey(){
+  if (ADMIN_LOGIN_REQUIRED) return;
   KEY = $('key').value.trim();
   localStorage.setItem(KEY_STORE, KEY);
   if (!KEY){ setAuth(false); toast('已清除 API Key', 'warn'); return; }
@@ -1450,12 +1505,27 @@ function toast(msg, kind){
 async function api(path, opts){
   opts = opts || {};
   opts.headers = Object.assign({'Content-Type':'application/json'}, opts.headers || {});
-  if (KEY) opts.headers['Authorization'] = 'Bearer ' + KEY;
+  const loginMode = typeof ADMIN_LOGIN_REQUIRED !== 'undefined' && ADMIN_LOGIN_REQUIRED;
+  if (loginMode) {
+    if (!adminSessionReady) throw new Error('请先确认管理登录状态');
+    delete opts.headers.Authorization;
+    delete opts.headers.authorization;
+    opts.credentials = 'same-origin';
+    if (!['GET', 'HEAD', 'OPTIONS'].includes((opts.method || 'GET').toUpperCase())) {
+      opts.headers['X-Muse-CSRF'] = ADMIN_CSRF;
+    }
+  } else if (KEY) opts.headers['Authorization'] = 'Bearer ' + KEY;
   const r = await fetch(path, opts);
   const txt = await r.text();
   let data; try { data = JSON.parse(txt); } catch(e){ data = null; }
   if (r.status === 401){
     setAuth(false);
+    if (loginMode) {
+      adminSessionReady = false;
+      document.body.dataset.adminSessionReady = 'false';
+      location.replace('/admin/login');
+      throw new Error('登录已失效，请重新登录');
+    }
     throw new Error('API Key 未填写或填写错误');
   }
   setAuth(true);
@@ -1549,7 +1619,7 @@ async function loadApikey(){
   }catch(e){
     $('inBase').value = location.origin + '/v1';
     fillExtFields(location.origin);
-    $('cmdText').textContent = '（先在右上角填入 API Key，这里会生成完整命令）';
+    $('cmdText').textContent = ADMIN_LOGIN_REQUIRED ? '（接入信息暂时无法读取，请稍后重试）' : '（先在右上角填入 API Key，这里会生成完整命令）';
   }
 }
 
@@ -1614,9 +1684,11 @@ async function rotateKey(){
   try{
     const d = await api('/admin/apikey/rotate', {method:'POST'});
     realKey = d.api_key;
-    KEY = d.api_key;
-    localStorage.setItem(KEY_STORE, KEY);
-    $('key').value = KEY;
+    if (!ADMIN_LOGIN_REQUIRED) {
+      KEY = d.api_key;
+      localStorage.setItem(KEY_STORE, KEY);
+      $('key').value = KEY;
+    }
     keyShown = true; renderKey();
     $('cmdText').textContent = buildCmd($('inBase').value);
     toast('已生成新 Key 并立即生效，本页已自动更新', 'ok');
@@ -2371,14 +2443,90 @@ async function loadStatus(){
 
 function refreshAll(){ loadStatus(); loadPool(); loadApikey(); loadRepoStatus(false); }
 
-refreshAll();
-setInterval(() => {
-  loadStatus(); loadPool();
-  if ($('tab-tasks').classList.contains('active')) loadTasks();
-}, 8000);
-setInterval(() => {
-  loadRepoStatus(false);
-}, 60000);
+let adminRefreshStarted = false;
+function startAdminRefresh(){
+  if (adminRefreshStarted) return;
+  adminRefreshStarted = true;
+  setInterval(() => {
+    if (ADMIN_LOGIN_REQUIRED && !adminSessionReady) return;
+    loadStatus(); loadPool();
+    if ($('tab-tasks').classList.contains('active')) loadTasks();
+  }, 8000);
+  setInterval(() => {
+    if (ADMIN_LOGIN_REQUIRED && !adminSessionReady) return;
+    loadRepoStatus(false);
+  }, 60000);
+}
+
+async function initializeAdmin(){
+  if (adminSessionLoading) return false;
+  if (!ADMIN_LOGIN_REQUIRED) {
+    refreshAll();
+    startAdminRefresh();
+    return true;
+  }
+  adminSessionLoading = true;
+  $('sessionRetry').hidden = true;
+  $('sessionGateMessage').textContent = '正在确认登录状态…';
+  try{
+    const r = await fetch('/admin/session', {
+      credentials: 'same-origin', cache: 'no-store', headers: {'Accept': 'application/json'}
+    });
+    if (r.status === 401) {
+      location.replace('/admin/login');
+      return false;
+    }
+    if (!r.ok) throw new Error('session unavailable');
+    const session = await r.json();
+    if (session.authenticated !== true || typeof session.csrf_token !== 'string' || !session.csrf_token) {
+      throw new Error('invalid session');
+    }
+    ADMIN_CSRF = session.csrf_token;
+    adminSessionReady = true;
+    document.body.dataset.adminSessionReady = 'true';
+    setAuth(true);
+    refreshAll();
+    startAdminRefresh();
+    return true;
+  }catch(e){
+    adminSessionReady = false;
+    document.body.dataset.adminSessionReady = 'false';
+    $('sessionGateMessage').textContent = '暂时无法确认登录状态，请重新连接。';
+    $('sessionRetry').hidden = false;
+    return false;
+  }finally{
+    adminSessionLoading = false;
+  }
+}
+
+async function logoutAdmin(){
+  if (!ADMIN_LOGIN_REQUIRED) return;
+  $('logoutButton').disabled = true;
+  try{
+    await api('/admin/logout', {method: 'POST', body: '{}'});
+    ADMIN_CSRF = '';
+    adminSessionReady = false;
+    KEY = '';
+    realKey = '';
+    document.body.dataset.adminSessionReady = 'false';
+    location.replace('/admin/login');
+  }catch(e){
+    if (authOK !== false) toast('退出登录失败，请稍后重试。', 'bad');
+  }finally{
+    $('logoutButton').disabled = false;
+  }
+}
+
+initializeAdmin();
+window.addEventListener('pagehide', () => {
+  if (ADMIN_LOGIN_REQUIRED) {
+    adminSessionReady = false;
+    document.body.dataset.adminSessionReady = 'false';
+  }
+});
+window.addEventListener('pageshow', event => {
+  if (ADMIN_LOGIN_REQUIRED && event.persisted) initializeAdmin();
+});
 </script>
 </body>
 </html>

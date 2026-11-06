@@ -89,6 +89,14 @@ class Config:
     # 鉴权
     api_key: str = field(default_factory=lambda: _env("MUSE2API_KEY", ""))
 
+    # 管理密码独立于业务 API Key；启用且未配置密码时管理端保持关闭。
+    admin_password: str = field(default_factory=lambda: _env("MUSE2API_ADMIN_PASSWORD", ""), repr=False)
+    admin_login_required: bool = field(
+        default_factory=lambda: _env("MUSE2API_ADMIN_LOGIN_REQUIRED", "0").strip().lower()
+        in ("1", "true", "yes", "on"))
+    admin_session_ttl: int = field(
+        default_factory=lambda: max(60, min(86400, int(_env("MUSE2API_ADMIN_SESSION_TTL", "28800")))))
+
     # 镜像由外部发布流程管理时，禁止管理接口修改或推送应用源码。
     managed_deployment: bool = field(
         default_factory=lambda: _env("MUSE2API_MANAGED_DEPLOYMENT", "false").strip().lower()

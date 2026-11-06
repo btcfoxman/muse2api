@@ -73,13 +73,33 @@
 | 持久化数据 | 部署目录的 `data/` |
 | Chromium profile | `data/chrome-profiles/` |
 | 宿主机 origin | `http://127.0.0.1:18610` |
+| 局域网管理地址 | `http://192.168.3.5:18610/admin` |
 | 公网管理地址 | `https://muse2api.aiid.edu.kg/admin` |
 | Cloudflared 配置 | `/etc/cloudflared/config.yml` |
 | Docker 网络 | `my-shared-net` |
 
-首次部署前准备部署目录、`data/` 和 `.env`。从 `.env.example` 复制配置，在私有编辑器中填写随机的 `MUSE2API_KEY`，将 `MUSE2API_PUBLIC_BASE` 设为 `https://muse2api.aiid.edu.kg`。不要把真实密钥写入 Git、命令输出或工作流日志。工作流不生成或打印应用密钥。
+首次部署前准备部署目录、`data/` 和 `.env`。从 `.env.example` 复制配置，在私有编辑器中分别填写随机的 `MUSE2API_KEY` 和 `MUSE2API_ADMIN_PASSWORD`，将 `MUSE2API_PUBLIC_BASE` 设为 `https://muse2api.aiid.edu.kg`。不要把真实密钥或管理密码写入 Git、命令输出或工作流日志。工作流不生成或打印这些凭据。
 
 Compose 把宿主机 `.env` 作为单文件可写挂载到 `/app/.env`，由应用加载可变配置；不通过 `env_file` 或容器环境再次注入 API key。因此管理台轮换的密钥写回宿主机配置，重建或重启容器后继续生效。`./data` 保留账号、任务、媒体及浏览器 profile。固定的容器路径、监听参数和托管发布开关由 Compose 提供。
+
+### 管理密码与登录
+
+托管部署强制开启管理端登录。在服务器 `/home/btcfoxman/docker/muse2api/.env` 配置：
+
+```dotenv
+MUSE2API_ADMIN_LOGIN_REQUIRED=1
+MUSE2API_ADMIN_PASSWORD=replace-with-a-private-admin-password
+MUSE2API_ADMIN_SESSION_TTL=28800
+MUSE2API_LAN_HOST=192.168.3.5
+```
+
+`MUSE2API_ADMIN_PASSWORD` 是独立管理密码，`MUSE2API_KEY` 继续用于业务 API 调用。修改管理密码后重启或重新部署容器使其生效；现有登录会失效，需要使用新密码登录。管理密码为空时，受保护的管理功能拒绝访问，不会自动使用 API Key 或默认密码。
+
+访问 `/` 或 `/admin` 时先进入 `/admin/login`。登录会话使用 HttpOnly Cookie，默认有效期 8 小时，支持退出登录；服务重启也会清除登录会话。公网 HTTPS 与局域网 HTTP 地址分别登录。管理页面、管理接口与接口文档均需要管理会话，业务 API Key 单独不能访问这些管理功能。
+
+登录后通过管理台导入、管理账号。旧版扩展、油猴或 Cookie 助手仅凭 API Key 调用 `/admin/accounts` 的方式不适用于强制登录模式；可提取 Cookie 后在已登录的管理台导入。业务 `/v1` 接口仍支持原有 Bearer API Key，成品 `/v1/media/` 保持可公开下载。
+
+Compose 同时保留 `127.0.0.1:18610` 给现有 Cloudflared origin，并只对 `MUSE2API_LAN_HOST` 指定的局域网地址开放 `18610`。更换服务器局域网地址时更新此变量并重新部署。
 
 ---
 

@@ -6,6 +6,7 @@ services:
     init: true
     ports:
       - "127.0.0.1:18610:18610"
+      - "${MUSE2API_LAN_HOST:-192.168.3.5}:18610:18610"
     environment:
       TZ: Asia/Taipei
       MUSE2API_HOME: /app
@@ -14,6 +15,7 @@ services:
       MUSE2API_CHROMIUM: /usr/bin/chromium
       MUSE2API_PROFILE_ROOT: /app/data/chrome-profiles
       MUSE2API_MANAGED_DEPLOYMENT: "1"
+      MUSE2API_ADMIN_LOGIN_REQUIRED: "1"
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
