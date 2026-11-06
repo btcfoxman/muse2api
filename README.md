@@ -58,6 +58,16 @@
 
 ## 🚀 极速部署
 
+### S3 结果存储
+
+登录管理台后打开 **S3 结果存储**，填写 S3-center API 地址、Bearer Token、逻辑桶和对象前缀，保存并启用。也可通过 `.env.example` 中的 `MUSE2API_RESULT_S3_ENABLED`、`MUSE2API_S3_CENTER_*` 配置初始值；管理台保存的配置优先，持久化到 `data/result_storage.json`，Token 留空保存会保留原值，接口不回显 Token。
+
+启用后，图片生成、图片编辑和视频任务会把成品原文件直传 S3-center，再返回下载链接；不转码、不拼接、不重新生成。单个原文件上限 256 MiB。协议与 ijm2api 相同：创建上传会话、按签发的地址和请求头 PUT 原字节、确认入库、申请 GET 链接。Token 需具备目标桶与对象前缀的 `uploads:write` 和 `objects:read` 权限；控制接口使用直连，不继承账号代理或系统代理。
+
+转存失败保留本地成品，生成仍然成功，返回本地公网链接及 `storage_status=failed`、`storage_error`，可在此页面按任务 ID 或文件名重试，也可点击媒体库中的“转存 S3”。重试只处理已有原文件；已经入库的对象只刷新链接。上传进度和入库凭据写入私有文件，支持进程重启后继续确认或签发链接，避免重复入库。查询图片/视频任务时会续签即将过期的链接；已经交付的 S3 链接本身仍受其有效期限制，过期后请重新查询任务。`b64_json` 返回格式保留原文件内容，本地 `/v1/media/` 链接继续可用。
+
+`GET/POST /admin/result-storage` 读取或保存配置，`POST /admin/result-storage/transfer` 使用 `{"task_id":"task_..."}` 或 `{"filename":"...webp"}` 转存已有成品。它们遵循管理端登录和 CSRF 校验，不接受单独使用业务 API Key 管理配置。删除本地媒体或任务记录不会删除 S3 对象。
+
 ### 3.5 pre：GitHub Actions 构建与部署
 
 源码仓库为 `btcfoxman/muse2api`。推送 `pre` 分支或手动运行 `.github/workflows/deploy-test.yml`：先在 GitHub 托管的 `ubuntu-latest` runner 构建镜像，在同一个候选镜像中执行隔离的 Python 回归、Chromium 与 HTTP 健康检查，并在托管 runner 执行 Node 前端回归；全部通过后，才推送 `ghcr.io/btcfoxman/muse2api:<commit-sha>` 和 `:pre`。部署使用不可变的 commit SHA 标签。

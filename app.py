@@ -59,6 +59,8 @@ from engine import (ESSENTIAL_COOKIES, MAX_REFERENCE_IMAGE_BYTES,
 from engine import MuseProxyError, _sniff_mime
 from store import Store, account_expiry, min_expiry
 from proxy import normalize_server, request_proxy_context
+from result_storage import ResultStorage, ResultStorageError
+from result_delivery import ResultDelivery
 
 import sys
 log = logging.getLogger("muse2api")
@@ -1001,6 +1003,45 @@ def media_url(name: str) -> str:
     return f"{base}/v1/media/{name}" if base else f"/v1/media/{name}"
 
 
+RESULT_STORAGE = ResultStorage(CFG)
+RESULT_DELIVERY = ResultDelivery(CFG, RESULT_STORAGE, media_url)
+
+
+def _deliver_result(res: dict) -> dict:
+    """Storage failures must never enter generation/account retries."""
+    local = {"filename": res["filename"], "size": res.get("size") or res.get("bytes") or 0,
+             "kind": res.get("kind") or "image"}
+    try:
+        return RESULT_DELIVERY.store_original(local)
+    except Exception as exc:  # A saved original remains a successful generation.
+        log.warning("Result storage unavailable (%s); original retained", type(exc).__name__)
+        return {**local, "url": media_url(local["filename"]), "storage_status": "failed",
+                "storage_error": "S3 结果转存暂时失败，已保留原始成品，可单独重试转存~"}
+
+
+def _task_delivery(task: dict, *, refresh=False) -> dict:
+    out = copy.deepcopy(task)
+    if out.get("status") != "completed":
+        return out
+    result = out.get("result") or {}
+    name = result.get("filename")
+    if name:
+        try:
+            asset = RESULT_DELIVERY.lookup(name, refresh=refresh)
+        except Exception as exc:
+            log.warning("Result URL lookup unavailable (%s)", type(exc).__name__)
+            asset = None
+        if asset:
+            result.update(asset)
+            out.update(result=result, url=asset["url"])
+            if out.get("kind") == "video":
+                out["video"] = {**out.get("video", {}), "url": asset["url"]}
+            if refresh and out != task:
+                store.update_task(task["id"], result=result, url=out["url"],
+                                  **({"video": out["video"]} if "video" in out else {}))
+    return out
+
+
 # ------------------------- cookie 解析 -------------------------
 def parse_cookie_text(text: str) -> dict[str, str]:
     """把 `a=1; b=2` / JSON / Set-Cookie 行解析成 dict。"""
@@ -1225,8 +1266,12 @@ def models(_=Depends(auth)):
 
 # ------------------------- 生图 -------------------------
 def _image_response(req: ImageRequest, res: dict) -> dict:
-    item = {"revised_prompt": req.prompt, "url": media_url(res["filename"]),
+    item = {"revised_prompt": req.prompt, "url": res.get("url") or media_url(res["filename"]),
             "size": req.size or "auto", "kind": res["kind"], "bytes": res["size"]}
+    if res.get("storage_status") not in (None, "disabled"):
+        item["storage_status"] = res["storage_status"]
+        if res.get("storage_error"):
+            item["storage_error"] = res["storage_error"]
     if req.response_format == "b64_json":
         fpath = res.get("path") or os.path.join(CFG.media_dir, res["filename"])
         with open(fpath, "rb") as f:
@@ -1302,12 +1347,14 @@ def _queue_image(req: ImageRequest, prompt: str, reference_images: list[str],
                 reference_images=reference_images,
                 on_progress=lambda p: store.update_task(tid, progress=p),
                 on_acquired=_on_acquired)
+            store.update_task(tid, progress=95, account=acc_id,
+                              result={**{k: res[k] for k in ("filename", "size", "kind")},
+                                      "url": media_url(res["filename"])})
+            res = _deliver_result(res)
             # Store only media metadata, not large base64 payloads or reference credentials.
             store.update_task(tid, status="completed", progress=100, account=acc_id,
                               elapsed=round(time.time() - timing["t0"], 1),
-                              url=media_url(res["filename"]),
-                              result={**{k: res[k] for k in ("filename", "size", "kind")},
-                                      "url": media_url(res["filename"])})
+                              url=res["url"], result=res)
         except Exception as exc:  # noqa: BLE001
             store.update_task(tid, status="failed", error=str(exc),
                               elapsed=round(time.time() - timing["t0"], 1))
@@ -1330,7 +1377,7 @@ def get_image_task(task_id: str, _=Depends(auth)):
     task = store.get_task(task_id)
     if not task or task.get("kind") != "image":
         raise HTTPException(404, "image task 不存在")
-    out = dict(task)
+    out = _task_delivery(task, refresh=True)
     if out.get("status") == "completed":
         req = ImageRequest(prompt=out["prompt"], size=out.get("size"),
                            response_format=out.get("response_format") or "url")
@@ -1354,6 +1401,7 @@ async def images_generations(req: ImageRequest, _=Depends(auth)):
         raise HTTPException(401, str(exc)) from exc
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
+    res = await asyncio.to_thread(_deliver_result, res)
     return _image_response(req, res)
 
 
@@ -1454,6 +1502,7 @@ async def images_edits(request: Request, _=Depends(auth)):
     except MuseGenerationError as exc:
         raise HTTPException(502, str(exc)) from exc
 
+    res = await asyncio.to_thread(_deliver_result, res)
     return _image_response(req_obj, res)
 
 
@@ -1481,14 +1530,16 @@ async def create_video(req: VideoRequest, _=Depends(auth)):
                 store.update_task(task["id"], progress=p)
             res, acc_id = _run_generation(prompt, "video", timeout, on_progress=prog_cb,
                                           reference_images=ref_images, on_acquired=_on_acquired)
-            vurl = media_url(res["filename"])
+            store.update_task(task["id"], progress=95, account=acc_id,
+                              result={**{k: res[k] for k in ("filename", "size", "kind")},
+                                      "url": media_url(res["filename"])})
+            res = _deliver_result(res)
+            vurl = res["url"]
             store.update_task(task["id"], status="completed", progress=100, account=acc_id,
                               elapsed=round(time.time() - timing["t0"], 1),
                               url=vurl,
                               video={"url": vurl},
-                              result={"url": vurl,
-                                      "filename": res["filename"],
-                                      "bytes": res["size"], "kind": res["kind"]})
+                              result={**res, "bytes": res["size"]})
         except Exception as exc:  # noqa: BLE001
             store.update_task(task["id"], status="failed",
                               elapsed=round(time.time() - timing["t0"], 1), error=str(exc))
@@ -1504,7 +1555,7 @@ def get_video(task_id: str, _=Depends(auth)):
     t = store.get_task(task_id)
     if not t:
         raise HTTPException(404, "task 不存在")
-    out = dict(t)
+    out = _task_delivery(t, refresh=True)
     status = out.get("status")
     if status in ("succeeded", "success", "done"):
         out["status"] = "completed"
@@ -1850,7 +1901,7 @@ def admin_status(_=Depends(auth)):
     return {
         "accounts": store.list_accounts(),
         "stats": store.stats(),
-        "tasks": store.list_tasks(20),
+        "tasks": [_task_delivery(t) for t in store.list_tasks(20)],
         "media_count": len(os.listdir(CFG.media_dir))
         if os.path.isdir(CFG.media_dir) else 0,
         "browser_running": bool(engine.proc and engine.proc.poll() is None),
@@ -2239,9 +2290,49 @@ def extension_files():
 
 
 # ------------------------- 管理：任务 / 媒体 -------------------------
+@app.get("/admin/result-storage")
+def result_storage_settings(_=Depends(auth)):
+    return RESULT_STORAGE.settings()
+
+
+@app.post("/admin/result-storage")
+def save_result_storage_settings(payload: dict = Body(...), _=Depends(auth)):
+    try:
+        return RESULT_STORAGE.update_settings(payload)
+    except ResultStorageError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/admin/result-storage/transfer")
+def transfer_existing_result(payload: dict = Body(...), _=Depends(auth)):
+    tid, name = payload.get("task_id"), payload.get("filename")
+    if bool(tid) == bool(name) or (tid and not isinstance(tid, str)):
+        raise HTTPException(400, "请仅提供任务 ID 或成品文件名中的一项")
+    if tid:
+        task = store.get_task(tid)
+        if not task:
+            raise HTTPException(404, "任务不存在")
+        if task.get("status") != "completed":
+            raise HTTPException(409, "仅允许转存已完成任务的原始成品")
+        name = (task.get("result") or {}).get("filename")
+    if not RESULT_STORAGE.enabled():
+        raise HTTPException(400, "请先配置并启用 S3 结果存储")
+    try:
+        path = RESULT_DELIVERY.original(name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    result = _deliver_result({"filename": name, "size": path.stat().st_size, "kind": "image"})
+    for task in list(store.tasks.values()):
+        if (task.get("result") or {}).get("filename") == name:
+            _task_delivery(task, refresh=True)
+    return {**result, **({"task_id": tid} if tid else {})}
+
+
 @app.get("/admin/tasks")
 def admin_tasks(limit: int = 50, _=Depends(auth)):
-    return {"tasks": store.list_tasks(limit)}
+    return {"tasks": [_task_delivery(t) for t in store.list_tasks(limit)]}
 
 
 @app.delete("/admin/tasks/{tid}")
@@ -2269,6 +2360,9 @@ def admin_media(_=Depends(auth)):
             items.append({"name": name, "url": media_url(name), "bytes": os.path.getsize(p),
                           "mtime": int(os.path.getmtime(p)),
                           "kind": "video" if ext in (".mp4", ".webm", ".mov") else "image"})
+            asset = RESULT_DELIVERY.lookup(name)
+            if asset:
+                items[-1].update({k: asset[k] for k in ("url", "storage_status", "storage_error") if k in asset})
     items.sort(key=lambda x: x["mtime"], reverse=True)
     return {"media": items, "count": len(items)}
 
@@ -2887,8 +2981,35 @@ async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
 @app.on_event("startup")
 async def _startup():
     for task in list(store.tasks.values()):
-        if task.get("kind") in ("image", "video") and task.get("status") in ("queued", "processing"):
-            store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
+        result = task.get("result") or {}
+        pending = task.get("status") in ("queued", "processing")
+        asset = (RESULT_DELIVERY.lookup(result["filename"])
+                 if task.get("status") == "completed" and result.get("filename") else None)
+        resume_upload = bool(asset and asset.get("storage_status") == "uploading")
+        if task.get("kind") in ("image", "video") and (pending or resume_upload):
+            try:
+                if result.get("filename"):
+                    RESULT_DELIVERY.original(result["filename"])
+                else:
+                    raise FileNotFoundError
+            except (ValueError, FileNotFoundError):
+                store.update_task(task["id"], status="failed", error="服务重启中断了任务，请重新提交")
+            else:
+                # Generation was already saved. Recover delivery only, never resubmit Muse.
+                url = media_url(result["filename"])
+                store.update_task(task["id"], status="completed", progress=100, error=None,
+                                  url=url, result={**result, "url": url},
+                                  **({"video": {"url": url}} if task["kind"] == "video" else {}))
+                def recover(tid=task["id"], saved=copy.deepcopy(result)):
+                    delivered = _deliver_result(saved)
+                    current = store.get_task(tid)
+                    if current:
+                        if current["kind"] == "video":
+                            delivered["bytes"] = delivered["size"]
+                        store.update_task(tid, result=delivered, url=delivered["url"],
+                                          **({"video": {"url": delivered["url"]}}
+                                             if current["kind"] == "video" else {}))
+                threading.Thread(target=recover, daemon=True).start()
     if not CFG.api_key:
         import secrets
         new_key = "m2a_" + secrets.token_hex(24)

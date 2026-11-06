@@ -106,6 +106,19 @@ class Config:
     public_base: str = field(
         default_factory=lambda: _env("MUSE2API_PUBLIC_BASE", ""))
 
+    # Optional original-result storage; admin overrides persist separately in data/.
+    result_s3_enabled: bool = field(
+        default_factory=lambda: _env("MUSE2API_RESULT_S3_ENABLED", "false").strip().lower()
+        in ("1", "true", "yes", "on"))
+    result_s3_center_api_base: str = field(
+        default_factory=lambda: _env("MUSE2API_S3_CENTER_API_BASE", ""))
+    result_s3_center_token: str = field(
+        default_factory=lambda: _env("MUSE2API_S3_CENTER_TOKEN", ""), repr=False)
+    result_s3_bucket: str = field(
+        default_factory=lambda: _env("MUSE2API_S3_CENTER_BUCKET", "assets"))
+    result_s3_key_prefix: str = field(
+        default_factory=lambda: _env("MUSE2API_S3_CENTER_KEY_PREFIX", "aicontent/ai-muse"))
+
     # 允许跨域调用导入接口的来源（Cookie 助手脚本从 muse.ai 页面提交时用）
     cors_origins: str = field(
         default_factory=lambda: _env("MUSE2API_CORS_ORIGINS",

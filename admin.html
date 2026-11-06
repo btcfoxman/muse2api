@@ -95,7 +95,7 @@
 
   /* ---------- 表单 ---------- */
   label{display:block;font-size:12.5px;color:var(--muted);margin-bottom:5px}
-  input[type=text],input[type=number],.proxy-dialog input[type=password],textarea,select{
+  input[type=text],input[type=number],.proxy-dialog input[type=password],.storage-form input[type=password],.storage-form input[type=url],textarea,select{
     width:100%;background:var(--bg2);color:var(--text);border:1px solid var(--line);border-radius:9px;
     padding:9px 12px;font-size:13px;outline:none;transition:.15s;font-family:inherit
   }
@@ -109,6 +109,20 @@
   .proxy-dialog .proxy-actions{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end;margin-top:24px}
   .proxy-summary{max-width:180px;font-size:11px;color:var(--muted);margin-top:4px}
   #proxyError{color:var(--bad);margin-top:12px;font-size:13px}
+  .storage-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap;margin-bottom:12px}
+  .storage-heading h3{margin:0;font-size:14.5px}
+  .storage-form{max-width:880px}
+  .storage-form fieldset{border:0;padding:0;margin:0;min-width:0}
+  .storage-toggle{display:flex;align-items:center;gap:9px;margin:0 0 18px;color:var(--text);font-size:13.5px;cursor:pointer}
+  .storage-toggle input{width:16px;height:16px;accent-color:var(--accent);margin:0}
+  .storage-fields{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:16px}
+  .storage-fields .wide{grid-column:1/-1}
+  .storage-form label:not(.storage-toggle){margin:0 0 6px}
+  .storage-form .hint{margin:6px 0 0}
+  .storage-feedback{margin-top:12px;min-height:20px;font-size:12.5px;overflow-wrap:anywhere}
+  .storage-feedback.bad{color:var(--bad)}.storage-feedback.ok{color:var(--ok)}
+  .storage-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:20px}
+  @media(max-width:600px){.storage-fields{grid-template-columns:minmax(0,1fr)}}
   button{
     background:var(--accent2);color:#fff;border:0;border-radius:9px;padding:9px 16px;
     font-size:13px;cursor:pointer;transition:.15s;font-family:inherit;white-space:nowrap
@@ -309,6 +323,7 @@
     <button data-t="cookie">获取 Cookie</button>
     <button data-t="tasks">任务记录</button>
     <button data-t="media">媒体库</button>
+    <button data-t="storage">S3 结果存储</button>
     <button data-t="play">接口测试</button>
     <button data-t="docs">接入文档</button>
   </nav>
@@ -591,6 +606,65 @@
     </div>
   </section>
 
+  <!-- ==================== S3 结果存储 ==================== -->
+  <section class="tab" id="tab-storage">
+    <div class="card">
+      <div class="storage-heading">
+        <h3>S3 结果存储</h3>
+        <span class="badge mute" id="storageBadge">尚未加载</span>
+      </div>
+      <div class="hint">开启后，生成的图片和视频按原文件转存 S3-center，并向调用者返回存储链接；文件不会重新编码。</div>
+      <form id="storageForm" class="storage-form" onsubmit="saveResultStorage(event)">
+        <fieldset id="storageFields" disabled>
+          <label class="storage-toggle" for="storageEnabled"><input id="storageEnabled" type="checkbox">启用 S3 结果存储</label>
+          <div class="storage-fields">
+            <div class="wide">
+              <label for="storageBase">控制 API Base URL</label>
+              <input id="storageBase" type="url" placeholder="https://s3-api.example.com" autocomplete="off" spellcheck="false">
+            </div>
+            <div>
+              <label for="storageBucket">存储桶</label>
+              <input id="storageBucket" type="text" value="assets" autocomplete="off" spellcheck="false">
+            </div>
+            <div>
+              <label for="storagePrefix">对象路径前缀</label>
+              <input id="storagePrefix" type="text" value="aicontent/ai-muse" maxlength="100" autocomplete="off" spellcheck="false">
+            </div>
+            <div class="wide">
+              <label for="storageToken">Bearer Token</label>
+              <input id="storageToken" type="password" placeholder="留空保留当前密钥" autocomplete="new-password" spellcheck="false" aria-describedby="storageTokenHint">
+              <div class="hint" id="storageTokenHint">密钥不会回显。</div>
+            </div>
+          </div>
+          <div class="storage-actions">
+            <button type="submit" id="storageSave">保存设置</button>
+            <button type="button" class="ghost" id="storageReload" onclick="reloadResultStorage()">重新读取</button>
+          </div>
+        </fieldset>
+      </form>
+      <div id="storageFeedback" class="storage-feedback" role="status" aria-live="polite"></div>
+    </div>
+    <div class="card">
+      <h3>转存已有成品</h3>
+      <div class="hint">转存失败时保留本地原文件；再次转存只上传已有成品，不会重新生成。可填写任务 ID 或媒体库文件名，也可在媒体库直接转存。</div>
+      <form class="storage-form" id="storageTransferForm" onsubmit="transferStoredResult(event)">
+        <div class="row">
+          <div style="max-width:170px">
+            <label for="storageTransferType">查找方式</label>
+            <select id="storageTransferType"><option value="task_id">任务 ID</option><option value="filename">媒体文件名</option></select>
+          </div>
+          <div style="flex:3">
+            <label for="storageTransferIdentity">任务 ID / 文件名</label>
+            <input type="text" id="storageTransferIdentity" autocomplete="off" spellcheck="false" required>
+          </div>
+          <button type="submit" id="storageTransferButton" disabled>转存到 S3</button>
+        </div>
+      </form>
+      <div class="hint" id="storageTransferHint" style="margin-top:10px">请先保存并启用 S3 结果存储。</div>
+      <div id="storageTransferFeedback" class="storage-feedback" role="status" aria-live="polite"></div>
+    </div>
+  </section>
+
   <!-- ==================== 接口测试 ==================== -->
   <section class="tab" id="tab-play">
     <div class="card">
@@ -833,6 +907,48 @@ function setLang(v){
 }
 /* 整句：中文 → 英文 */
 const I18N_EN = {
+  "S3 结果存储": "S3 result storage",
+  "尚未加载": "Not loaded",
+  "开启后，生成的图片和视频按原文件转存 S3-center，并向调用者返回存储链接；文件不会重新编码。": "When enabled, generated images and videos are stored in S3-center and callers receive storage links. Original files are uploaded without re-encoding.",
+  "启用 S3 结果存储": "Enable S3 result storage",
+  "控制 API Base URL": "Control API base URL",
+  "存储桶": "Bucket",
+  "对象路径前缀": "Object key prefix",
+  "留空保留当前密钥": "Leave blank to keep the saved token",
+  "密钥不会回显。": "The saved token is never displayed.",
+  "已配置密钥，留空保留。": "A token is configured. Leave blank to keep it.",
+  "尚未配置密钥，请填写后保存。": "No token is configured. Enter a token and save.",
+  "保存设置": "Save settings",
+  "重新读取": "Reload settings",
+  "转存已有成品": "Store an existing result",
+  "转存失败时保留本地原文件；再次转存只上传已有成品，不会重新生成。可填写任务 ID 或媒体库文件名，也可在媒体库直接转存。": "If storage fails, the local original is retained. Retrying uploads the existing result without generating again. Enter a task ID or media filename, or use the media library action.",
+  "查找方式": "Find by",
+  "媒体文件名": "Media filename",
+  "任务 ID / 文件名": "Task ID / filename",
+  "转存到 S3": "Store in S3",
+  "转存 S3": "Store in S3",
+  "请先保存并启用 S3 结果存储。": "Save and enable S3 result storage first.",
+  "设置已修改，尚未保存。": "Settings have unsaved changes.",
+  "重新读取会丢弃未保存的设置，是否继续？": "Reloading will discard your unsaved changes. Continue?",
+  "正在读取存储设置…": "Loading storage settings…",
+  "存储设置已读取。": "Storage settings loaded.",
+  "读取存储设置失败，请重新读取。": "Storage settings could not be loaded. Try reloading.",
+  "正在保存存储设置…": "Saving storage settings…",
+  "S3 结果存储设置已保存。": "S3 result storage settings saved.",
+  "保存存储设置失败，请检查配置后重试。": "Storage settings could not be saved. Check the configuration and retry.",
+  "已启用": "Enabled",
+  "未启用": "Disabled",
+  "保存失败": "Save failed",
+  "读取失败": "Load failed",
+  "可转存已有成品，原文件会保留。": "Existing results can be stored. Local originals are retained.",
+  "请填写任务 ID 或媒体文件名。": "Enter a task ID or media filename.",
+  "正在转存已有成品…": "Uploading the existing result…",
+  "转存完成，结果链接已更新。": "Stored successfully. The result link has been updated.",
+  "转存未完成，本地原文件已保留，可重试转存。": "Storage did not complete. The local original is retained and can be retried.",
+  "转存失败，本地原文件已保留。": "Storage failed. The local original is retained.",
+  "已转存 S3": "Stored in S3",
+  "转存失败": "Storage failed",
+  "转存中": "Uploading to S3",
   "已登录": "Signed in",
   "退出登录": "Sign out",
   "登录已失效": "Session expired",
@@ -1600,6 +1716,7 @@ document.querySelectorAll('nav.tabs button').forEach(b => {
     $('tab-' + b.dataset.t).classList.add('active');
     if (b.dataset.t === 'tasks') loadTasks();
     if (b.dataset.t === 'media') loadMedia();
+    if (b.dataset.t === 'storage') loadResultStorage();
     if (b.dataset.t === 'cookie') $('cmdText').textContent = buildCmd($('inBase').value);
   };
 });
@@ -2068,6 +2185,142 @@ async function clearTasks(){
   }catch(e){ toast('清空失败：' + e.message, 'bad'); }
 }
 
+/* ================= S3 结果存储 ================= */
+let resultStorageSettings = null;
+let resultStorageDirty = false;
+let resultStorageBusy = false;
+let resultStorageTransferBusy = false;
+
+function storageMessage(id, message, kind){
+  const el = $(id);
+  el.textContent = message;
+  el.className = 'storage-feedback' + (kind ? ' ' + kind : '');
+}
+
+function updateStorageTransferControls(){
+  const enabled = resultStorageSettings && resultStorageSettings.result_s3_enabled === true;
+  $('storageTransferButton').disabled = !enabled || resultStorageTransferBusy;
+  $('storageTransferHint').textContent = enabled
+    ? '可转存已有成品，原文件会保留。' : '请先保存并启用 S3 结果存储。';
+  document.querySelectorAll('[data-storage-transfer]').forEach(button => {
+    button.disabled = resultStorageTransferBusy || resultStorageSettings !== null && !enabled;
+  });
+}
+
+function renderResultStorage(settings){
+  resultStorageSettings = settings;
+  $('storageEnabled').checked = settings.result_s3_enabled === true;
+  $('storageBase').value = settings.result_s3_center_api_base || '';
+  $('storageBucket').value = settings.result_s3_bucket || 'assets';
+  $('storagePrefix').value = settings.result_s3_key_prefix || 'aicontent/ai-muse';
+  $('storageToken').value = '';
+  $('storageTokenHint').textContent = settings.result_s3_center_token_configured
+    ? '已配置密钥，留空保留。' : '尚未配置密钥，请填写后保存。';
+  $('storageBadge').className = 'badge ' + (settings.result_s3_enabled ? 'ok' : 'mute');
+  $('storageBadge').textContent = settings.result_s3_enabled ? '已启用' : '未启用';
+  resultStorageDirty = false;
+  updateStorageTransferControls();
+}
+
+async function loadResultStorage(force){
+  if (resultStorageBusy || resultStorageDirty && !force) return;
+  resultStorageBusy = true;
+  $('storageFields').disabled = true;
+  storageMessage('storageFeedback', '正在读取存储设置…');
+  try{
+    renderResultStorage(await api('/admin/result-storage'));
+    storageMessage('storageFeedback', '存储设置已读取。');
+  }catch(e){
+    $('storageBadge').className = 'badge bad';
+    $('storageBadge').textContent = '读取失败';
+    storageMessage('storageFeedback', '读取存储设置失败，请重新读取。', 'bad');
+    $('storageReload').disabled = false;
+  }finally{
+    resultStorageBusy = false;
+    // Keep the reload button reachable even if the initial request failed.
+    $('storageFields').disabled = false;
+  }
+}
+
+function reloadResultStorage(){
+  if (resultStorageDirty && !confirm('重新读取会丢弃未保存的设置，是否继续？')) return;
+  loadResultStorage(true);
+}
+
+$('storageForm').addEventListener('input', () => {
+  resultStorageDirty = true;
+  storageMessage('storageFeedback', '设置已修改，尚未保存。');
+});
+
+async function saveResultStorage(event){
+  event.preventDefault();
+  if (resultStorageBusy) return;
+  resultStorageBusy = true;
+  const payload = {
+    result_s3_enabled: $('storageEnabled').checked,
+    result_s3_backend: 's3_center_direct',
+    result_s3_center_api_base: $('storageBase').value.trim(),
+    result_s3_bucket: $('storageBucket').value.trim(),
+    result_s3_key_prefix: $('storagePrefix').value.trim(),
+  };
+  const token = $('storageToken').value.trim();
+  if (token) payload.result_s3_center_token = token;
+  $('storageFields').disabled = true;
+  storageMessage('storageFeedback', '正在保存存储设置…');
+  try{
+    renderResultStorage(await api('/admin/result-storage', {method:'POST', body:JSON.stringify(payload)}));
+    storageMessage('storageFeedback', 'S3 结果存储设置已保存。', 'ok');
+    toast('S3 结果存储设置已保存。', 'ok');
+  }catch(e){
+    $('storageBadge').className = 'badge bad';
+    $('storageBadge').textContent = '保存失败';
+    storageMessage('storageFeedback', '保存存储设置失败，请检查配置后重试。' + (e.message ? '\n' + e.message : ''), 'bad');
+  }finally{
+    resultStorageBusy = false;
+    $('storageFields').disabled = false;
+  }
+}
+
+async function transferResultToStorage(identity, button){
+  if (resultStorageTransferBusy) return;
+  if (!resultStorageSettings) await loadResultStorage();
+  if (!resultStorageSettings || resultStorageSettings.result_s3_enabled !== true){
+    toast('请先保存并启用 S3 结果存储。', 'warn');
+    goTab('storage');
+    return;
+  }
+  resultStorageTransferBusy = true;
+  updateStorageTransferControls();
+  if (button) button.disabled = true;
+  storageMessage('storageTransferFeedback', '正在转存已有成品…');
+  try{
+    const result = await api('/admin/result-storage/transfer', {method:'POST', body:JSON.stringify(identity)});
+    if (result.storage_status !== 'stored'){
+      const message = result.storage_error || '转存未完成，本地原文件已保留，可重试转存。';
+      storageMessage('storageTransferFeedback', message, 'bad');
+      toast(message, 'warn');
+      return;
+    }
+    storageMessage('storageTransferFeedback', '转存完成，结果链接已更新。', 'ok');
+    toast('转存完成，结果链接已更新。', 'ok');
+    loadMedia(); loadTasks();
+  }catch(e){
+    storageMessage('storageTransferFeedback', '转存失败，本地原文件已保留。' + (e.message ? '\n' + e.message : ''), 'bad');
+    toast('转存失败，本地原文件已保留。', 'bad');
+  }finally{
+    resultStorageTransferBusy = false;
+    updateStorageTransferControls();
+  }
+}
+
+async function transferStoredResult(event){
+  event.preventDefault();
+  const value = $('storageTransferIdentity').value.trim();
+  if (!value) return toast('请填写任务 ID 或媒体文件名。', 'warn');
+  const key = $('storageTransferType').value === 'filename' ? 'filename' : 'task_id';
+  await transferResultToStorage({[key]:value});
+}
+
 /* ================= 媒体库 ================= */
 let _allMedia = [];
 let _selectedMedia = new Set();
@@ -2178,6 +2431,9 @@ async function loadMedia(){
     }
     $('mediaGrid').innerHTML = ms.map(m => {
       const isSel = _selectedMedia.has(m.name);
+      const storageBadge = m.storage_status === 'stored' ? '<span class="badge ok">已转存 S3</span>'
+        : m.storage_status === 'failed' ? `<span class="badge warn" title="${esc(m.storage_error || '')}">转存失败</span>`
+        : m.storage_status === 'uploading' ? '<span class="badge info">转存中</span>' : '';
       return `
       <div class="tile ${isSel ? 'selected' : ''}" data-name="${esc(m.name)}">
         <label class="check-tag" title="勾选以批量操作" onclick="event.stopPropagation()">
@@ -2189,14 +2445,17 @@ async function loadMedia(){
         <div class="meta">
           <div class="nm" title="${esc(m.name)}">${esc(m.name)}</div>
           <div style="margin-top:3px">${fmtBytes(m.bytes)} · ${fmtTime(m.mtime)}</div>
+          ${storageBadge ? `<div style="margin-top:6px">${storageBadge}</div>` : ''}
           <div class="ac">
             <a class="badge info" href="${esc(m.url)}" target="_blank">打开</a>
             <a class="badge mute" href="${esc(m.url)}" download>下载</a>
+            <button type="button" class="ghost mini" data-storage-transfer onclick="transferResultToStorage({filename:this.closest('.tile').dataset.name},this)">转存 S3</button>
             <a class="badge bad" href="javascript:void(0)" onclick="delSingleMedia('${esc(m.name)}')">删除</a>
           </div>
         </div>
       </div>`;
     }).join('');
+    updateStorageTransferControls();
     updateMediaSelectionUI();
   }catch(e){ $('mediaGrid').innerHTML = `<div class="empty">加载失败：${esc(e.message)}</div>`; }
 }
