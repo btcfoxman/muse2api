@@ -31,12 +31,14 @@ from contextlib import contextmanager
 import base64
 import collections
 import binascii
+import errno
 import io
 import hashlib
 import json
 import logging
 import os
 import re
+import tempfile
 import threading
 import time
 import uuid
@@ -1847,7 +1849,8 @@ def admin_status(_=Depends(auth)):
                    "image_timeout": CFG.image_timeout,
                    "video_timeout": CFG.video_timeout,
                    "host": CFG.host, "port": CFG.port,
-                   "public_base": base},
+                   "public_base": base,
+                   "managed_deployment": CFG.managed_deployment},
     }
 
 
@@ -2099,6 +2102,9 @@ async def query_any_quota(_=Depends(auth)):
 
 
 # ------------------------- 管理：接入信息 / API Key -------------------------
+_ENV_WRITE_LOCK = threading.RLock()
+
+
 def _public_base() -> str:
     return (CFG.public_base or "").rstrip("/")
 
@@ -2117,32 +2123,54 @@ def rotate_apikey(_=Depends(auth)):
     """生成新的 API Key，写入 .env 并立即生效（不用重启）。"""
     import secrets
     new_key = "m2a_" + secrets.token_hex(24)
-    old = CFG.api_key
-    CFG.api_key = new_key
-    _persist_env("MUSE2API_KEY", new_key)
+    with _ENV_WRITE_LOCK:
+        old = CFG.api_key
+        _persist_env("MUSE2API_KEY", new_key)
+        CFG.api_key = new_key
     return {"ok": True, "api_key": new_key, "previous": old,
             "message": "已生成新 Key 并立即生效；旧 Key 已失效，请更新下游项目"}
 
 
 def _persist_env(key: str, value: str):
-    """把配置写回 .env（保留其它行，原子替换）。"""
-    path = os.path.join(CFG.base_dir, ".env")
-    try:
-        with open(path, encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except OSError:
-        lines = []
-    found = False
-    for i, ln in enumerate(lines):
-        if ln.strip().startswith(key + "="):
-            lines[i] = f"{key}={value}"
-            found = True
-    if not found:
-        lines.append(f"{key}={value}")
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines).strip() + "\n")
-    os.replace(tmp, path)
+    """串行保存配置；普通文件原子替换，单文件绑定挂载在 EBUSY 时原位写回。"""
+    with _ENV_WRITE_LOCK:
+        path = os.path.join(CFG.base_dir, ".env")
+        try:
+            with open(path, encoding="utf-8") as f:
+                lines = f.read().splitlines()
+        except FileNotFoundError:
+            lines = []
+        found = False
+        for i, ln in enumerate(lines):
+            if ln.strip().startswith(key + "="):
+                lines[i] = f"{key}={value}"
+                found = True
+        if not found:
+            lines.append(f"{key}={value}")
+        content = "\n".join(lines).strip() + "\n"
+        fd, tmp = tempfile.mkstemp(prefix=".env-", suffix=".tmp", dir=CFG.base_dir)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(content)
+                f.flush()
+                os.fsync(f.fileno())
+            try:
+                os.replace(tmp, path)
+            except OSError as exc:
+                if exc.errno != errno.EBUSY:
+                    raise
+                # Docker cannot replace a single-file bind mount's inode.
+                # Restrict permissions before writing any credentials in place.
+                with open(path, "r+", encoding="utf-8") as f:
+                    os.chmod(path, 0o600)
+                    f.seek(0)
+                    f.write(content)
+                    f.truncate()
+                    f.flush()
+                    os.fsync(f.fileno())
+        finally:
+            if os.path.exists(tmp):
+                os.unlink(tmp)
 
 
 # ------------------------- 管理：Cookie 获取 -------------------------
@@ -2277,7 +2305,8 @@ def _admin_html() -> str:
     p = os.path.join(BASE_DIR, "admin.html")
     try:
         with open(p, encoding="utf-8") as f:
-            return f.read()
+            return f.read().replace("__MANAGED_DEPLOYMENT__",
+                                    "true" if CFG.managed_deployment else "false")
     except OSError:
         return ("<!doctype html><meta charset=utf-8><body style='background:#0b0f19;"
                 "color:#e6e8ee;font-family:system-ui;padding:40px'>"
@@ -2527,8 +2556,14 @@ def _git(args: list[str], timeout: int = 30):
     )
 
 
+def _require_repo_write():
+    if CFG.managed_deployment:
+        raise HTTPException(403, "受管镜像部署已禁用在线升级与源码推送，请通过 GitHub Actions 发布镜像")
+
+
 def _ensure_git_repo(token: str = ""):
     """确保 BASE_DIR 已初始化为绑定 czg86389-hub/muse2api 的 Git 仓库。"""
+    _require_repo_write()
     git_dir = os.path.join(BASE_DIR, ".git")
     remote_url = f"https://x-access-token:{token}@github.com/czg86389-hub/muse2api.git" if token else f"{REPO_URL}.git"
     if not os.path.isdir(git_dir):
@@ -2628,7 +2663,8 @@ def _check_update_sync(force: bool = False) -> dict:
         pass
 
     # 若用户通过 Docker/ZIP 部署（无 .git）且首次运行版本一致，记录初始基准 SHA
-    if not local_sha and remote_sha and local_version == remote_version:
+    if (not CFG.managed_deployment and not local_sha and remote_sha
+            and local_version == remote_version):
         local_sha = remote_sha
         try:
             with open(_installed_sha_file(), "w", encoding="utf-8") as f:
@@ -2650,6 +2686,7 @@ def _check_update_sync(force: bool = False) -> dict:
 
     data = {
         "repo_url": REPO_URL,
+        "managed_deployment": CFG.managed_deployment,
         "has_git": has_git,
         "local_version": local_version,
         "remote_version": remote_version,
@@ -2673,6 +2710,7 @@ def _check_update_sync(force: bool = False) -> dict:
 
 def _upgrade_from_github_sync() -> dict:
     """从 GitHub 拉取最新代码覆盖核心文件（兼容 Git 与无 Git 的 Docker/ZIP 环境），绝不触碰 .env 与 data/。"""
+    _require_repo_write()
     import requests
     import tarfile
 
@@ -2745,6 +2783,7 @@ async def admin_check_update(force: bool = False):
 @app.post("/admin/repo/pull")
 async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
     """一键从 GitHub 官方仓库拉取最新更新并自动平滑重启服务。"""
+    _require_repo_write()
     res = await asyncio.to_thread(_upgrade_from_github_sync)
     restart = payload.get("restart", True) if isinstance(payload, dict) else True
     if restart:
@@ -2762,6 +2801,7 @@ async def admin_upgrade_now(payload: dict = Body(default={}), _=Depends(auth)):
 @app.post("/admin/repo/push")
 async def admin_repo_push(payload: dict = Body(default={}), _=Depends(auth)):
     """维护者专用：将当前节点核心代码推送到 GitHub 仓库（自动过滤 .env 与 data 目录）。"""
+    _require_repo_write()
     msg = (payload.get("message") or "").strip() or f"chore: sync update ({time.strftime('%Y-%m-%d %H:%M:%S')})"
     new_token = (payload.get("github_token") or "").strip()
     if new_token:

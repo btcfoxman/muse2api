@@ -194,9 +194,12 @@
   .keybox.miss .lbl{color:var(--warn)}
   .langsel{width:auto;flex:0 0 auto;background:var(--bg2);color:var(--text);border:1px solid var(--line2);border-radius:999px;padding:4px 10px;font-size:12px;cursor:pointer}
   .updpill-alert{border-color:rgba(251,191,36,.8)!important;background:rgba(251,191,36,.15)!important;color:var(--warn)!important;animation:pulse 1.6s infinite}
+  body[data-managed-deployment="true"] [data-repo-write] { display:none !important; }
+  #managedDeploymentNotice { display:none; }
+  body[data-managed-deployment="true"] #managedDeploymentNotice { display:block; }
 </style>
 </head>
-<body>
+<body data-managed-deployment="__MANAGED_DEPLOYMENT__">
 
 <header>
   <div class="hwrap">
@@ -243,7 +246,7 @@
       </div>
     </div>
     <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <button onclick="upgradeNow()" id="btnBannerUpgrade">⚡ 一键在线升级并重启</button>
+      <button onclick="upgradeNow()" id="btnBannerUpgrade" data-repo-write>⚡ 一键在线升级并重启</button>
       <button class="ghost mini" onclick="toggleRepoPanel()">查看更新内容</button>
       <button class="ghost mini" onclick="dismissUpdateBanner()">暂不提醒</button>
     </div>
@@ -253,14 +256,15 @@
   <div class="card" id="repoPanel" style="display:none;border-color:rgba(79,140,255,.45);margin-bottom:16px">
     <h3>
       <svg viewBox="0 0 16 16" width="15" height="15" fill="currentColor"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"></path></svg>
-      官方仓库版本检测与在线热升级
+      <span id="repoPanelTitle">官方仓库版本检测与在线热升级</span>
       <a href="https://github.com/czg86389-hub/muse2api" target="_blank" class="tag" style="color:var(--accent)">czg86389-hub/muse2api ↗</a>
       <span id="repoBadge" class="badge info" style="margin-left:auto">检测中…</span>
     </h3>
     <div class="hint" id="repoStatusDesc" data-i18n="repo-status-desc">正在实时对比本地版本与 GitHub 官方仓库最新版本…（在线升级自动保留 <code>.env</code> 密钥与 <code>data/</code> 账号池及媒体数据）</div>
+    <div class="hint" id="managedDeploymentNotice">当前服务通过镜像发布，更新请使用 GitHub Actions 发布流程。</div>
     <div id="repoCommitsBox" style="margin-top:10px;background:var(--bg2);border:1px solid var(--line);border-radius:9px;padding:10px 14px;font-size:12.5px"></div>
     <div style="margin-top:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center">
-      <button onclick="upgradeNow()" id="btnRepoPull">⚡ 一键从 GitHub 在线更新并重启</button>
+      <button onclick="upgradeNow()" id="btnRepoPull" data-repo-write>⚡ 一键从 GitHub 在线更新并重启</button>
       <button class="ghost" onclick="loadRepoStatus(true)">🔍 立即重新检测更新</button>
       <a href="https://github.com/czg86389-hub/muse2api/commits/main" target="_blank" class="btnlike ghostlike" style="padding:7px 13px;font-size:12.5px">查看 GitHub 完整提交记录 ↗</a>
     </div>
@@ -2202,6 +2206,18 @@ async function runVideo(){
 }
 
 /* ================= 官方仓库实时更新检测、弹窗通知与一键升级 ================= */
+const MANAGED_DEPLOYMENT = document.body.dataset.managedDeployment === 'true';
+function managedDeploymentMessage(){
+  return LANG === 'en'
+    ? 'This service is deployed from an image. Publish updates through GitHub Actions.'
+    : '当前服务通过镜像发布，更新请使用 GitHub Actions 发布流程。';
+}
+if (MANAGED_DEPLOYMENT) {
+  $('managedDeploymentNotice').textContent = managedDeploymentMessage();
+  $('repoStatusDesc').textContent = managedDeploymentMessage();
+  $('updBannerMsg').textContent = managedDeploymentMessage();
+  $('repoPanelTitle').textContent = LANG === 'en' ? 'Official repository version check' : '官方仓库版本检测';
+}
 let _notifiedSha = localStorage.getItem('muse2api_notified_sha') || '';
 let _dismissedSha = localStorage.getItem('muse2api_dismissed_sha') || '';
 let _lastRepoStatus = null;
@@ -2264,14 +2280,15 @@ async function loadRepoStatus(force){
       topBtn.classList.add('updpill-alert');
       topBtn.innerHTML = `🔔 <span id="repoTopTxt">发现新更新 (${esc(s.remote_sha || rVer)})</span>`;
       $('updBannerVer').textContent = `${lVer} (${s.local_sha || '旧版'}) → ${rVer} (${s.remote_sha || '最新'})`;
-      $('updBannerMsg').innerHTML = `最新仓库提交：<b>${esc(s.remote_msg || '性能优化与功能更新')}</b> · 点击右侧「⚡ 一键在线升级并重启」即可自动拉取更新（保留本地配置与账号数据）。`;
+      $('updBannerMsg').innerHTML = `最新仓库提交：<b>${esc(s.remote_msg || '性能优化与功能更新')}</b> · ` +
+        (MANAGED_DEPLOYMENT ? esc(managedDeploymentMessage()) : '点击右侧「⚡ 一键在线升级并重启」即可自动拉取更新（保留本地配置与账号数据）。');
       if (_dismissedSha !== s.remote_sha){
         banner.classList.add('show');
       }
       if (_notifiedSha !== s.remote_sha && s.remote_sha){
         _notifiedSha = s.remote_sha;
         localStorage.setItem('muse2api_notified_sha', _notifiedSha);
-        toast(`🔔 官方仓库发布了新更新 (${s.remote_sha})：${s.remote_msg || '点击顶部一键升级'}`, 'warn');
+        toast(`🔔 官方仓库发布了新更新 (${s.remote_sha})：${s.remote_msg || (MANAGED_DEPLOYMENT ? managedDeploymentMessage() : '点击顶部一键升级')}`, 'warn');
       }
     } else {
       badge.className = 'badge ok';
@@ -2304,6 +2321,7 @@ async function loadRepoStatus(force){
 }
 
 async function upgradeNow(){
+  if (MANAGED_DEPLOYMENT) { toast(managedDeploymentMessage(), 'warn'); return; }
   if (!confirm('确定立即从 GitHub 官方仓库 (czg86389-hub/muse2api) 拉取最新代码并自动重启服务吗？\n\n（注：本地 .env 密钥、账号池 Cookie 和已生成的媒体文件均会自动保留，不受任何影响）')) return;
   const btn1 = $('btnRepoPull'), btn2 = $('btnBannerUpgrade');
   if (btn1) { btn1.disabled = true; btn1.innerHTML = '<span class="spin"></span>正在在线更新…'; }

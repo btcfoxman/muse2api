@@ -1,0 +1,108 @@
+name: Pre-production Docker
+
+on:
+  push:
+    branches: [pre]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: muse2api-pre-production
+  cancel-in-progress: false
+
+env:
+  IMAGE_REGISTRY: ghcr.io
+  IMAGE_NAMESPACE: btcfoxman
+  IMAGE_NAME: muse2api
+  DEPLOY_PATH: /home/btcfoxman/docker/muse2api
+  DEPLOY_SERVICE: muse2api
+  MUSE2API_HOSTNAME: muse2api.aiid.edu.kg
+  MUSE2API_ORIGIN: http://127.0.0.1:18610
+  CLOUDFLARED_CONFIG: /etc/cloudflared/config.yml
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build candidate on hosted runner
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          load: true
+          push: false
+          tags: |
+            ghcr.io/btcfoxman/muse2api:${{ github.sha }}
+            ghcr.io/btcfoxman/muse2api:pre
+          build-args: APP_GIT_SHA=${{ github.sha }}
+          platforms: linux/amd64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+          sbom: false
+      - name: Verify candidate with isolated offline regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network none --shm-size 2g \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/tests,target=/app/tests,readonly" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/scripts,target=/app/scripts,readonly" \
+            --mount "type=bind,source=$(command -v node),target=/usr/local/bin/node,readonly" \
+            -e EXPECTED_GIT_SHA="$GITHUB_SHA" \
+            "ghcr.io/btcfoxman/muse2api:$GITHUB_SHA" python scripts/verify_image.py
+          node --test tests/*.mjs
+      - name: Publish the verified image
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker push "ghcr.io/btcfoxman/muse2api:$GITHUB_SHA"
+          docker push ghcr.io/btcfoxman/muse2api:pre
+
+  deploy:
+    needs: build
+    runs-on: [self-hosted, linux, x64, muse2api-pre]
+    timeout-minutes: 40
+    env:
+      IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Isolate registry authentication
+        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/muse2api-docker-auth" >> "$GITHUB_ENV"
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Pull and deploy persisted service
+        run: bash scripts/deploy_pre.sh
+      - name: Configure existing Cloudflared ingress
+        run: bash scripts/cloudflared_pre.sh
+      - name: Verify public health and authentication
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 30); do
+            if curl -fsS --max-time 10 "https://${MUSE2API_HOSTNAME}/healthz" >/dev/null; then
+              status="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 10 "https://${MUSE2API_HOSTNAME}/v1/models")"
+              if [ "$status" = 401 ]; then exit 0; fi
+            fi
+            sleep 5
+          done
+          echo 'Public service health/authentication check failed' >&2
+          exit 1

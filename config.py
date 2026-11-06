@@ -89,6 +89,11 @@ class Config:
     # 鉴权
     api_key: str = field(default_factory=lambda: _env("MUSE2API_KEY", ""))
 
+    # 镜像由外部发布流程管理时，禁止管理接口修改或推送应用源码。
+    managed_deployment: bool = field(
+        default_factory=lambda: _env("MUSE2API_MANAGED_DEPLOYMENT", "false").strip().lower()
+        in ("1", "true", "yes", "on"))
+
     # 对外地址（管理页面显示「接入地址」用；留空则页面用当前域名兜底）
     public_base: str = field(
         default_factory=lambda: _env("MUSE2API_PUBLIC_BASE", ""))

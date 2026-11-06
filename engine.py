@@ -348,8 +348,12 @@ class MuseEngine:
 
     def start(self):
         with self._start_lock:
-            if self.proc and self.proc.poll() is None and self.browser:
-                return
+            self._start_locked()
+
+    def _start_locked(self):
+        """Serialize CDP reuse, profile lock cleanup and process startup with stop()."""
+        if self.proc and self.proc.poll() is None and self.browser:
+            return
         env = dict(os.environ)
         env.setdefault("HOME", self.cfg.home_dir)
         env["PATH"] = (self.cfg.extra_path + os.pathsep + env.get("PATH", "")) if self.cfg.extra_path else env.get("PATH", "")

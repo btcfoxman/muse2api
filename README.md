@@ -52,75 +52,54 @@
   - 无需手工 F12 抓包，点一下扩展图标即刻将当前浏览器登录态（含 `HttpOnly` 核心 Cookie 与真实过期时间）提取并安全推送至账号池。
 - 🖥️ **现代化深色运维面板（Web Console）与实时在线热升级**
   - 内置开箱即用的 Web UI，支持实时查看服务健康度、账号池额度与状态、一键全池保活、任务进度回放、媒体库管理与在线接口调试。
-  - **全网节点实时更新广播与一键升级**：当官方 GitHub 仓库发布新版本或修复时，所有已部署节点的管理后台顶部会自动弹出更新通知横幅，点击 **「⚡ 一键在线升级并重启」** 即可自动拉取最新代码并平滑重启（自动保留本地 `.env` 配置与账号数据）。
+  - 本仓库的镜像部署由 GitHub Actions 管理。管理台保留上游更新查询；`MUSE2API_MANAGED_DEPLOYMENT=1` 时禁止在线覆盖代码、推送源码及应用内重启，发布通过工作流完成。
 
 ---
 
 ## 🚀 极速部署
 
-### 方式一：Docker Compose（推荐，一行命令开箱即用）
+### 3.5 pre：GitHub Actions 构建与部署
 
-1. **克隆代码并进入目录**：
-   ```bash
-   git clone https://github.com/czg86389-hub/muse2api.git
-   cd muse2api
-   ```
+源码仓库为 `btcfoxman/muse2api`。推送 `pre` 分支或手动运行 `.github/workflows/deploy-test.yml`：先在 GitHub 托管的 `ubuntu-latest` runner 构建镜像，在同一个候选镜像中执行隔离的 Python 回归、Chromium 与 HTTP 健康检查，并在托管 runner 执行 Node 前端回归；全部通过后，才推送 `ghcr.io/btcfoxman/muse2api:<commit-sha>` 和 `:pre`。部署使用不可变的 commit SHA 标签。
 
-2. **配置环境变量（可选）**：
-   ```bash
-   cp .env.example .env
-   # 按需编辑 .env，建议修改 MUSE2API_KEY 为你自己的管理密钥
-   ```
+3.5 pre 只拉取镜像、更新配置、重建该服务并做轻量检查；禁止现场构建镜像、安装应用依赖或执行完整应用验证。托管 runner 或 registry 故障时修复 CI/registry，不在服务器构建。
 
-   Docker Compose 会读取 `.env` 中的 `MUSE2API_KEY`，不会再被 Compose 文件中的示例值覆盖。
+| 项目 | 配置 |
+| --- | --- |
+| 仓库专用部署 runner 标签 | `self-hosted,linux,x64,muse2api-pre` |
+| 部署目录 | `/home/btcfoxman/docker/muse2api` |
+| 服务 / 容器 | `muse2api` |
+| 私有配置 | 部署目录的 `.env`，权限 `0600` |
+| 持久化数据 | 部署目录的 `data/` |
+| Chromium profile | `data/chrome-profiles/` |
+| 宿主机 origin | `http://127.0.0.1:18610` |
+| 公网管理地址 | `https://muse2api.aiid.edu.kg/admin` |
+| Cloudflared 配置 | `/etc/cloudflared/config.yml` |
+| Docker 网络 | `my-shared-net` |
 
-3. **启动容器**：
-   ```bash
-   docker compose up -d
-   ```
+首次部署前准备部署目录、`data/` 和 `.env`。从 `.env.example` 复制配置，在私有编辑器中填写随机的 `MUSE2API_KEY`，将 `MUSE2API_PUBLIC_BASE` 设为 `https://muse2api.aiid.edu.kg`。不要把真实密钥写入 Git、命令输出或工作流日志。工作流不生成或打印应用密钥。
 
-4. **访问管理面板**：
-   打开浏览器访问：`http://<你的服务器IP>:18610/admin?key=<你的MUSE2API_KEY>`
+Compose 把宿主机 `.env` 作为单文件可写挂载到 `/app/.env`，由应用加载可变配置；不通过 `env_file` 或容器环境再次注入 API key。因此管理台轮换的密钥写回宿主机配置，重建或重启容器后继续生效。`./data` 保留账号、任务、媒体及浏览器 profile。固定的容器路径、监听参数和托管发布开关由 Compose 提供。
 
 ---
 
-### 方式二：裸机 / VPS 部署（Ubuntu / Debian）
+GitHub 自动 `GITHUB_TOKEN` 只需 `contents: read`、`packages: write`，无需长期 GHCR/SSH secret。runner 必须注册到此仓库，具备 Docker 权限和更新现有 Cloudflared 配置、DNS 路由及重启 connector 的必要 sudo 权限。DNS 使用现有 `~/.cloudflared/cert.pem`（或 root 的证书），不新增 tunnel。若改用 SSH 部署，使用 `DEPLOY_HOST`、`DEPLOY_USER`、`DEPLOY_SSH_KEY`、`DEPLOY_PORT`；不需要把这些 secret 配置给当前专用 runner 方案。
 
-1. **安装系统依赖与 Chromium**：
-   ```bash
-   sudo apt-get update
-   sudo apt-get install -y chromium fonts-wqy-zenhei python3 python3-pip python3-venv
-   ```
+`scripts/deploy_pre.sh` 保存上一版 Compose 和镜像引用到 `.releases/`，拉取选定镜像，等待 JSON 中的异步图片/视频任务结束，然后以 `--no-build --pull never` 重建该服务。它不会修改 `.env` 或 `data/`。聊天与同步请求没有持久化任务记录，维护发布前应先停止新的客户端请求并等待现有同步调用完成。
 
-2. **配置 Python 虚拟环境**：
-   ```bash
-   cd /opt/muse2api
-   python3 -m venv venv
-   source venv/bin/activate
-   pip install -r requirements.txt
-   ```
+Cloudflared 脚本先验证候选配置，再备份和安装，保留其他 ingress、`protocol: http2` 以及现有 edge relay。DNS 路由失败时终止并恢复原配置，仅配置发生变化时重启原 connector。
 
-3. **配置 systemd 服务**：
-   ```bash
-   sudo cp deploy/muse2api.service /etc/systemd/system/
-   sudo systemctl daemon-reload
-   sudo systemctl enable --now muse2api
-   ```
+本机及公网 `/healthz` 应返回 200，未鉴权 `/v1/models` 应返回 401。`/readyz` 只报告进程的账号状态，无账号仍返回 200；健康检查通过不代表已有可用 Muse 账号。镜像通过 `APP_GIT_SHA` 和 OCI `org.opencontainers.image.revision` 标注构建提交。
 
-4. **Nginx 反向代理配置（重要：防止 502 超时与流式卡顿）**：
-   如使用 Nginx / 宝塔 / 1Panel 反代，务必将 `proxy_read_timeout` 调大至 `600s` 并关闭 `proxy_buffering`（详见 `deploy/nginx.example.conf`）：
-   ```nginx
-   location / {
-       proxy_pass http://127.0.0.1:18610;
-       proxy_read_timeout 600s;      # 避免生图/视频耗时较长被 Nginx 报 502 Bad Gateway
-       proxy_send_timeout 600s;
-       proxy_buffering off;          # 保证 SSE 对话流式打字机 0 延迟吐字
-       client_max_body_size 200M;    # 支持视频/音频等大参考素材上传
-       proxy_set_header Host $host;
-       proxy_set_header X-Real-IP $remote_addr;
-       proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-   }
-   ```
+回滚时先暂停新请求并确认持久化任务已结束，从对应 `.releases/<release>/previous-image` 获取上一版 SHA，必要时恢复其 `docker-compose.previous.yml`，然后在部署目录运行（把 `<previous-sha>` 替换为保存的标签）：
+
+```bash
+IMAGE_REGISTRY=ghcr.io IMAGE_NAMESPACE=btcfoxman IMAGE_NAME=muse2api IMAGE_TAG=<previous-sha> docker compose pull muse2api
+IMAGE_REGISTRY=ghcr.io IMAGE_NAMESPACE=btcfoxman IMAGE_NAME=muse2api IMAGE_TAG=<previous-sha> docker compose up -d --no-deps --no-build --pull never muse2api
+curl -fsS http://127.0.0.1:18610/healthz
+```
+
+镜像选择参数仅通过命令临时环境传入，不写入应用 `.env`。已有账号的独立代理如需访问宿主机代理，可使用 `host.docker.internal`。
 
 ---
 
@@ -362,12 +341,14 @@ Nginx 反代需把 `client_max_body_size` 调到 200M 左右，否则大素材�
 
 | 变量名 | 默认值 | 作用与说明 |
 |---|---|---|
-| `MUSE2API_KEY` | 自动生成 | 管理控制台与 API 鉴权密钥（以 `m2a_` 开头） |
+| `MUSE2API_KEY` | 部署前必填 | 管理控制台与 API 鉴权密钥，存于私有 `.env` |
 | `MUSE2API_HOST` | `127.0.0.1` | 监听 IP（Docker 内建议 `0.0.0.0`） |
 | `MUSE2API_PORT` | `18610` | 服务运行端口 |
 | `MUSE2API_PUBLIC_BASE` | `空` | 对外完整 URL 前缀，留空时前端自动识别访问来源 |
 | `MUSE2API_CHROMIUM` | `chromium` | 浏览器可执行程序完整路径 |
 | `MUSE2API_CDP_PORT` | `19210` | 内部 CDP 调试通信端口 |
+| `MUSE2API_PROFILE_ROOT` | Compose：`/app/data/chrome-profiles` | 持久化的 Chromium profile 根目录 |
+| `MUSE2API_MANAGED_DEPLOYMENT` | Compose：`1` | 禁止应用内覆盖源码、推送及在线重启，由 GitHub Actions 发布 |
 | `MUSE2API_CONCURRENCY` | `2` | 最大并发生成任务数（支持随服务器资源自由调高，默认 2） |
 | `MUSE2API_IMAGE_TIMEOUT` | `240` | 生图超时上限（秒） |
 | `MUSE2API_VIDEO_TIMEOUT` | `600` | 生视频超时上限（秒） |
@@ -479,7 +460,7 @@ python tests/test_vm_wait.py engine.py --assert
 
 更新到 v1.5.3 并重启服务后，点击账号“测试”重新确认。旧版已写入的异常不会被无条件洗成正常。鼠标悬停备注可查看完整错误；反馈请提供 HTTP 状态、版本与部署环境，**不要公开 Cookie、API Key 或带 key 的管理页链接**。
 
-裸机 Git 部署：`git pull --ff-only` 后重启对应服务；Docker Compose：`git pull --ff-only && docker compose up -d --build`。请先保存本地自定义修改，保留 `.env` 与 `data/`。
+此仓库使用 GitHub Actions 镜像发布流程，更新和回滚方法见上方部署章节；保留服务器 `.env` 与 `data/`。
 
 不使用真实账号、不消耗生成额度的回归测试：
 
