@@ -30,6 +30,8 @@ jobs:
     timeout-minutes: 40
     outputs:
       image_tag: ${{ github.sha }}
+      digest: ${{ steps.publish.outputs.digest }}
+      image_size: ${{ steps.publish.outputs.image_size }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -69,11 +71,19 @@ jobs:
             "ghcr.io/btcfoxman/muse2api:$GITHUB_SHA" python scripts/verify_image.py
           node --test tests/*.mjs
       - name: Publish the verified image
+        id: publish
         shell: bash
         run: |
           set -euo pipefail
           docker push "ghcr.io/btcfoxman/muse2api:$GITHUB_SHA"
           docker push ghcr.io/btcfoxman/muse2api:pre
+          digest="$(docker image inspect --format '{{index .RepoDigests 0}}' "ghcr.io/btcfoxman/muse2api:$GITHUB_SHA")"
+          digest="${digest##*@}"
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          image_size="$(docker image inspect --format '{{.Size}}' "ghcr.io/btcfoxman/muse2api:$GITHUB_SHA")"
+          [[ "$image_size" =~ ^[1-9][0-9]*$ ]]
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+          echo "image_size=$image_size" >> "$GITHUB_OUTPUT"
 
   deploy:
     needs: build
@@ -81,10 +91,16 @@ jobs:
     timeout-minutes: 40
     env:
       IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+      IMAGE_DIGEST: ${{ needs.build.outputs.digest }}
+      IMAGE_SIZE: ${{ needs.build.outputs.image_size }}
     steps:
       - uses: actions/checkout@v4
       - name: Isolate registry authentication
-        run: echo "DOCKER_CONFIG=$RUNNER_TEMP/muse2api-docker-auth" >> "$GITHUB_ENV"
+        run: |
+          registry_dir="$RUNNER_TEMP/muse2api-docker-auth-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          mkdir -p "$registry_dir"
+          chmod 700 "$registry_dir"
+          echo "DOCKER_CONFIG=$registry_dir" >> "$GITHUB_ENV"
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io

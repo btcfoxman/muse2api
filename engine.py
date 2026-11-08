@@ -1629,11 +1629,27 @@ class MuseEngine:
                     name: str = "") -> tuple[str, str]:
             mime = (mime or "").split(";", 1)[0].strip().lower()
             mime = _MIME_ALIASES.get(mime, mime)
-            if mime in _GENERIC_MIMES:
-                mime = (_sniff_mime(data)
-                        or _MIME_ALIASES.get(mimetypes.guess_type(name)[0] or "",
-                                             mimetypes.guess_type(name)[0] or "")
-                        or "")
+            detected = _sniff_mime(data)
+            guessed = mimetypes.guess_type(name)[0] or ""
+            guessed = _MIME_ALIASES.get(guessed, guessed)
+            # Some CDNs label a raw image body as multipart/form-data. Recover
+            # only a recognized image signature, never a filename or an actual
+            # multipart envelope. Keep the original bytes and image dimensions.
+            if mime == "multipart/form-data":
+                mime = detected if detected and detected.startswith("image/") else ""
+            elif mime in _GENERIC_MIMES:
+                # A .jpg suffix cannot turn an HTML/JSON error or PDF into an
+                # image. Extension fallback remains for legacy Word documents.
+                mime = detected or (guessed if not guessed.startswith("image/") else "")
+                if guessed.startswith("image/") and not mime.startswith("image/"):
+                    mime = ""
+            if mime.startswith("image/"):
+                prefix = data.lstrip(b"\xef\xbb\xbf \t\r\n")
+                if ((detected and not detected.startswith("image/"))
+                        or prefix.startswith((b"<", b"{", b"["))):
+                    mime = ""
+                elif detected:
+                    mime = detected
             if mime not in REFERENCE_MIME_EXT:
                 raise MuseGenerationError(
                     f"参考文件类型不受支持（{mime or 'unknown'}）；"
@@ -1676,6 +1692,11 @@ class MuseEngine:
                 return checked(data, mime, name=urllib.parse.urlsplit(img).path)
             except (RefImageSafetyError, MuseGenerationError):
                 raise
+            except urllib.error.HTTPError as exc:
+                # Keep the useful HTTP status without leaking signed URLs or
+                # response bodies into task errors.
+                raise MuseGenerationError(
+                    f"下载远程参考图失败: HTTP {exc.code}") from exc
             except Exception as exc:
                 raise MuseGenerationError(
                     f"下载远程参考图失败: {type(exc).__name__}") from exc

@@ -1,9 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
-: "${DEPLOY_PATH:?}" "${DEPLOY_SERVICE:?}" "${IMAGE_REGISTRY:?}" "${IMAGE_NAMESPACE:?}" "${IMAGE_NAME:?}" "${IMAGE_TAG:?}" "${MUSE2API_ORIGIN:?}"
+: "${DEPLOY_PATH:?}" "${DEPLOY_SERVICE:?}" "${IMAGE_REGISTRY:?}" "${IMAGE_NAMESPACE:?}" "${IMAGE_NAME:?}" "${IMAGE_TAG:?}" "${IMAGE_DIGEST:?}" "${IMAGE_SIZE:?}" "${MUSE2API_ORIGIN:?}"
 [[ "$IMAGE_TAG" =~ ^[0-9a-f]{40}$ ]]
 
 repo_compose="$(pwd)/docker-compose.yml"
+verified_pull="$(pwd)/scripts/pull_verified_image.py"
+if [ -f "$DEPLOY_PATH/docker-compose.yml" ] && ! cmp -s "$repo_compose" "$DEPLOY_PATH/docker-compose.yml"; then
+  echo 'Existing deployment compose differs from the reviewed repository; preserving it and refusing application-only deployment.' >&2
+  exit 1
+fi
 test -d "$DEPLOY_PATH/data"
 test -f "$DEPLOY_PATH/.env"
 python3 - "$DEPLOY_PATH/.env" <<'PY'
@@ -40,13 +45,19 @@ if docker inspect "$DEPLOY_SERVICE" >/dev/null 2>&1; then
   fi
   docker inspect -f '{{.Config.Image}}' "$DEPLOY_SERVICE" > "$release/previous-image"
 fi
-cp "$repo_compose" "$DEPLOY_PATH/docker-compose.yml"
+if [ ! -f "$DEPLOY_PATH/docker-compose.yml" ]; then
+  cp "$repo_compose" "$DEPLOY_PATH/docker-compose.yml"
+fi
 cd "$DEPLOY_PATH"
 docker compose config --quiet
 docker network inspect my-shared-net >/dev/null 2>&1 || docker network create my-shared-net
 
-# Image selection stays in this command environment, outside the application .env.
-IMAGE_REGISTRY="$IMAGE_REGISTRY" IMAGE_NAMESPACE="$IMAGE_NAMESPACE" IMAGE_NAME="$IMAGE_NAME" IMAGE_TAG="$IMAGE_TAG" docker compose pull "$DEPLOY_SERVICE"
+# Compare the same private image layer over direct and the server's configured
+# proxy, then import the immutable, hash-checked cloud artifact. The Docker
+# daemon's fixed proxy and the application's private .env are left untouched.
+python3 "$verified_pull" \
+  --image "${IMAGE_REGISTRY}/${IMAGE_NAMESPACE}/${IMAGE_NAME}:${IMAGE_TAG}" \
+  --digest "$IMAGE_DIGEST" --image-size "$IMAGE_SIZE" --deploy-path "$DEPLOY_PATH"
 
 # JSON task records are atomically written by Store. Count every nonterminal state,
 # and fail closed for invalid data rather than discarding accepted generations.
