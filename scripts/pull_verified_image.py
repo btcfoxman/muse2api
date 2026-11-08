@@ -159,7 +159,7 @@ def pull(binary,reference,archive,proxy):
                 size=archive.stat().st_size if archive.exists()else 0
                 if current-start>900:raise RuntimeError('image_download_budget_exhausted')
                 if current-last>=45:
-                    if size-last_size<45*32768:raise RuntimeError('image_download_route_too_slow')
+                    if size-last_size<45*131072:raise RuntimeError('image_download_route_too_slow')
                     last,last_size=current,size
             if process.returncode:raise RuntimeError('crane_pull_failed')
         finally:
