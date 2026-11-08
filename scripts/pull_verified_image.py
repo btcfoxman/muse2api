@@ -5,11 +5,12 @@ Docker daemon proxy settings are left untouched; crane obeys its process env.
 """
 import argparse
 import base64
+import gzip
 import hashlib
 import io
 import json
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import shutil
 import signal
@@ -29,9 +30,12 @@ ACCEPT=', '.join(('application/vnd.oci.image.index.v1+json','application/vnd.oci
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):return None
 
-def command(args,env=None,timeout=30):
-    result=subprocess.run(args,env=env,capture_output=True,timeout=timeout)
-    if result.returncode:raise RuntimeError('verified_image_operation_failed')
+def command(args,env=None,timeout=30,stage='docker_operation'):
+    if not re.fullmatch(r'[a-z_]{1,48}',stage):raise ValueError('invalid operation stage')
+    try:result=subprocess.run(args,env=env,capture_output=True,timeout=timeout)
+    except subprocess.TimeoutExpired:raise RuntimeError('verified_image_timeout:'+stage)from None
+    except OSError:raise RuntimeError('verified_image_unavailable:'+stage)from None
+    if result.returncode:raise RuntimeError('verified_image_failed:'+stage+':exit='+str(result.returncode))
     return result.stdout
 
 def route_environment(proxy):
@@ -66,10 +70,10 @@ def read_bounded(url,proxy,headers=None,limit=2097152):
     return value
 
 def configured_proxy():
-    raw=command(['docker','info','--format','{{json .HTTPSProxy}}']).decode().strip()
+    raw=command(['docker','info','--format','{{json .HTTPSProxy}}'],stage='docker_proxy_info').decode().strip()
     proxy=json.loads(raw)if raw else''
     if not proxy:
-        raw=command(['docker','info','--format','{{json .HTTPProxy}}']).decode().strip()
+        raw=command(['docker','info','--format','{{json .HTTPProxy}}'],stage='docker_proxy_info').decode().strip()
         proxy=json.loads(raw)if raw else''
     if not proxy:return''
     parsed=urllib.parse.urlsplit(proxy)
@@ -151,7 +155,7 @@ def pull(binary,reference,archive,proxy):
                 except subprocess.TimeoutExpired:process.kill();process.wait(timeout=5)
 
 def check_disk_budget(root,compressed,image_size):
-    docker_root=Path(command(['docker','info','--format','{{.DockerRootDir}}']).decode().strip())
+    docker_root=Path(command(['docker','info','--format','{{.DockerRootDir}}'],stage='docker_storage_info').decode().strip())
     if not docker_root.is_absolute() or not docker_root.is_dir():raise RuntimeError('docker_storage_location_unavailable')
     if not isinstance(image_size,int) or image_size<=0:raise RuntimeError('image_size_required')
     # The archive stays compressed, while Docker may stage and unpack layers.
@@ -163,6 +167,128 @@ def check_disk_budget(root,compressed,image_size):
         sufficient=(shutil.disk_usage(root).free>=archive_budget and
                     shutil.disk_usage(docker_root).free>=docker_budget)
     if not sufficient:raise RuntimeError('image_import_disk_budget_unavailable')
+
+MAX_EXPANDED_BYTES=16*1024*1024*1024
+MAX_VALIDATION_SECONDS=180
+GZIP_LAYERS={'application/vnd.oci.image.layer.v1.tar+gzip',
+    'application/vnd.docker.image.rootfs.diff.tar.gzip'}
+RAW_LAYERS={'application/vnd.oci.image.layer.v1.tar',
+    'application/vnd.docker.image.rootfs.diff.tar'}
+
+def validate_config(raw,descriptor,revision):
+    if ('sha256:'+hashlib.sha256(raw).hexdigest()!=descriptor['digest']
+            or len(raw)!=descriptor['size']):raise RuntimeError('registry_config_digest_mismatch')
+    config=json.loads(raw)
+    if config.get('os')!='linux'or config.get('architecture')!='amd64':raise RuntimeError('image_config_platform_mismatch')
+    runtime=config.get('config')
+    if not isinstance(runtime,dict):raise RuntimeError('image_config_invalid')
+    if (runtime.get('Labels')or{}).get('org.opencontainers.image.revision')!=revision:
+        raise RuntimeError('image_config_revision_mismatch')
+    rootfs=config.get('rootfs')or{}
+    if rootfs.get('type')!='layers'or not isinstance(rootfs.get('diff_ids'),list):raise RuntimeError('image_rootfs_invalid')
+    if not all(re.fullmatch(r'sha256:[a-f0-9]{64}',str(value))for value in rootfs['diff_ids']):
+        raise RuntimeError('image_rootfs_digest_invalid')
+    return config
+
+def validate_archive(archive,manifest,config_raw,config,temporary_tag):
+    """Verify compressed digests and uncompressed diff_ids without extracting files."""
+    started=time.monotonic();expanded=0
+    layers=manifest['layers'];diff_ids=config['rootfs']['diff_ids']
+    if not 0<len(layers)<=256 or len(layers)!=len(diff_ids):raise RuntimeError('image_layer_count_mismatch')
+    compressed=sum(row['size']for row in layers)
+    if archive.stat().st_size>compressed+64*1024*1024:raise RuntimeError('image_archive_size_budget_exhausted')
+    def budget():
+        if time.monotonic()-started>MAX_VALIDATION_SECONDS:raise RuntimeError('image_archive_validation_timeout')
+    class HashedReader:
+        def __init__(self,stream):self.stream=stream;self.digest=hashlib.sha256();self.count=0
+        def read(self,size=-1):
+            budget();value=self.stream.read(size);self.digest.update(value);self.count+=len(value);return value
+    def member_bytes(bundle,entry,limit):
+        if entry.size>limit:raise RuntimeError('image_archive_metadata_too_large')
+        stream=bundle.extractfile(entry)
+        with stream:return stream.read(limit+1)
+    with tarfile.open(archive,mode='r:')as bundle:
+        members={}
+        for entry in bundle:
+            budget();path=PurePosixPath(entry.name)
+            if (len(members)>=len(layers)+2 or entry.name in members or not entry.isfile()or entry.size<0
+                or '\\'in entry.name or path.is_absolute()or '..'in path.parts or str(path)!=entry.name):
+                raise RuntimeError('image_archive_member_invalid')
+            members[entry.name]=entry
+        if 'manifest.json'not in members:raise RuntimeError('image_archive_manifest_missing')
+        records=json.loads(member_bytes(bundle,members['manifest.json'],2097152))
+        if not isinstance(records,list)or len(records)!=1:raise RuntimeError('image_archive_manifest_invalid')
+        record=records[0]
+        if record.get('RepoTags')!=[temporary_tag]:raise RuntimeError('image_archive_tags_mismatch')
+        names=record.get('Layers')
+        if not isinstance(names,list)or len(names)!=len(layers):raise RuntimeError('image_archive_layers_mismatch')
+        config_name=record.get('Config')
+        if not isinstance(config_name,str)or config_name not in members or not all(isinstance(name,str)and name in members for name in names):
+            raise RuntimeError('image_archive_member_reference_invalid')
+        required=set(names)|{'manifest.json',config_name}
+        if set(members)!=required:raise RuntimeError('image_archive_members_mismatch')
+        if member_bytes(bundle,members[config_name],2097152)!=config_raw:
+            raise RuntimeError('image_archive_config_mismatch')
+        for descriptor,name,diff_id in zip(layers,names,diff_ids):
+            entry=members[name]
+            if entry.size!=descriptor['size']:raise RuntimeError('image_archive_layer_size_mismatch')
+            raw=HashedReader(bundle.extractfile(entry));digest=hashlib.sha256()
+            media=descriptor.get('mediaType')
+            if media in GZIP_LAYERS:stream=gzip.GzipFile(fileobj=raw,mode='rb')
+            elif media in RAW_LAYERS:stream=raw
+            else:raise RuntimeError('image_archive_compression_unsupported')
+            try:
+                while True:
+                    chunk=stream.read(1048576)
+                    if not chunk:break
+                    expanded+=len(chunk);digest.update(chunk);budget()
+                    if expanded>MAX_EXPANDED_BYTES:raise RuntimeError('image_archive_expansion_budget_exhausted')
+                while raw.read(1048576):pass
+            finally:
+                if stream is not raw:stream.close()
+                raw.stream.close()
+            if raw.count!=descriptor['size']or'sha256:'+raw.digest.hexdigest()!=descriptor['digest']:
+                raise RuntimeError('image_archive_compressed_digest_mismatch')
+            if 'sha256:'+digest.hexdigest()!=diff_id:raise RuntimeError('image_archive_rootfs_digest_mismatch')
+    return {'verified_layer_count':len(layers),'verified_expanded_bytes':expanded,
+        'verified_compressed_layer_bytes':compressed}
+
+CONFIG_DEFAULTS={'Hostname':'','Domainname':'','User':'','AttachStdin':False,'AttachStdout':False,
+    'AttachStderr':False,'Tty':False,'OpenStdin':False,'StdinOnce':False,'NetworkDisabled':False,
+    'ArgsEscaped':False,'Env':[],'Cmd':[],'Entrypoint':[],'OnBuild':[],'Shell':[],
+    'Volumes':{},'ExposedPorts':{},'Labels':{},'WorkingDir':'','Image':'','MacAddress':'',
+    'StopSignal':'','StopTimeout':0,'Healthcheck':None}
+
+def semantic_config(values):
+    result={}
+    for key,value in values.items():
+        default=CONFIG_DEFAULTS.get(key)
+        if key in CONFIG_DEFAULTS and value is None:value=default
+        if key=='Healthcheck'and isinstance(value,dict):
+            health_defaults={'Test':[],'Interval':0,'Timeout':0,'StartPeriod':0,'StartInterval':0,'Retries':0}
+            value={name:(health_defaults[name]if item is None and name in health_defaults else item)for name,item in value.items()}
+            value={name:item for name,item in value.items()if name not in health_defaults or item!=health_defaults[name]}
+            value=value or None
+        if key not in CONFIG_DEFAULTS or value!=default:result[key]=value
+    return result
+
+def verify_loaded_image(info,config,revision):
+    actual_id=info.get('Id','')
+    if not re.fullmatch(r'sha256:[a-f0-9]{64}',actual_id):raise RuntimeError('loaded_image_id_invalid')
+    expected=semantic_config(config['config']);actual=semantic_config(info.get('Config')or{})
+    if actual!=expected:
+        raise RuntimeError('loaded_image_config_mismatch')
+    if (info.get('Config',{}).get('Labels')or{}).get('org.opencontainers.image.revision')!=revision:
+        raise RuntimeError('loaded_image_revision_mismatch')
+    if info.get('Os')!=config['os']or info.get('Architecture')!=config['architecture']:
+        raise RuntimeError('loaded_image_platform_mismatch')
+    rootfs=info.get('RootFS')or{}
+    if rootfs.get('Type')!=config['rootfs']['type']or rootfs.get('Layers')!=config['rootfs']['diff_ids']:
+        raise RuntimeError('loaded_image_rootfs_mismatch')
+    for source,target in(('variant','Variant'),('os.version','OsVersion'),('os.features','OsFeatures')):
+        if source in config and config[source]!=info.get(target):raise RuntimeError('loaded_image_platform_metadata_mismatch')
+    if type(info.get('Size'))is not int or info['Size']<=0:raise RuntimeError('loaded_image_size_invalid')
+    return actual_id
 
 def main():
     parser=argparse.ArgumentParser();parser.add_argument('--image',required=True);parser.add_argument('--digest',required=True)
@@ -196,8 +322,21 @@ def main():
         manifest=json.loads(raw)
     config_digest=manifest['config']['digest']
     if not re.fullmatch(r'sha256:[a-f0-9]{64}',config_digest):raise RuntimeError('invalid_image_config')
+    if type(manifest['config'].get('size'))is not int or not 0<manifest['config']['size']<=2097152:
+        raise RuntimeError('invalid_image_config_size')
     if not all(re.fullmatch(r'sha256:[a-f0-9]{64}',str(row.get('digest',''))) for row in manifest['layers']):
         raise RuntimeError('invalid_layer_digest')
+    if not all(type(row.get('size'))is int and row['size']>0 for row in manifest['layers']):
+        raise RuntimeError('invalid_layer_size')
+    revision=args.image.rsplit(':',1)[1]
+    config_raw=None
+    for route in dict.fromkeys([metadata_route,*routes]):
+        try:
+            candidate=read_bounded('https://ghcr.io/v2/'+repository+'/blobs/'+config_digest,route,authorization)
+            config=validate_config(candidate,manifest['config'],revision)
+            config_raw=candidate;break
+        except Exception:continue
+    if config_raw is None:raise RuntimeError('registry_verified_config_unavailable')
     layers=[row for row in manifest['layers']if row['size']>=1048576]
     if not layers:raise RuntimeError('image_transfer_sample_unavailable')
     layer=max(layers,key=lambda row:row['size'])
@@ -215,15 +354,27 @@ def main():
                 selected='proxy'if route else'direct';break
             except Exception:archive.unlink(missing_ok=True)
         if selected is None:raise RuntimeError('all_bounded_image_transfer_routes_failed')
-        command(['docker','load','-i',str(archive)],timeout=240)
-        info=json.loads(command(['docker','image','inspect',config_digest]))[0]
-        revision=args.image.rsplit(':',1)[1]
-        if info['Id']!=config_digest or (info['Config'].get('Labels')or{}).get('org.opencontainers.image.revision')!=revision:
-            raise RuntimeError('loaded_image_identity_mismatch')
-        if int(info.get('Size',0))!=args.image_size:raise RuntimeError('loaded_image_size_mismatch')
-        command(['docker','tag',config_digest,args.image])
+        temporary_tag='ghcr.io/'+repository+':i-was-a-digest'
+        try:archive_proof=validate_archive(archive,manifest,config_raw,config,temporary_tag)
+        except RuntimeError:raise
+        except (OSError,ValueError,TypeError,KeyError,tarfile.TarError):
+            raise RuntimeError('image_archive_validation_failed')from None
+        # Docker stores differ in their reported Size. Budget with the measured,
+        # cryptographically checked uncompressed layer bytes before importing.
+        check_disk_budget(root,compressed,archive_proof['verified_expanded_bytes'])
+        command(['docker','load','-i',str(archive)],timeout=240,stage='docker_load_verified_archive')
+        loaded=command(['docker','image','inspect',temporary_tag],stage='docker_inspect_loaded_tag')
+        try:
+            info=json.loads(loaded)[0]
+            actual_id=verify_loaded_image(info,config,revision)
+        except RuntimeError:raise
+        except (ValueError,TypeError,KeyError,IndexError,AttributeError):
+            raise RuntimeError('docker_loaded_metadata_invalid')from None
+        command(['docker','tag',actual_id,args.image],stage='docker_tag_verified_revision')
     receipt={'image':args.image,'manifest_digest':args.digest,'platform_manifest_digest':image_digest,
-        'loaded_config_digest':config_digest,'selected_route':selected,'route_samples':samples,
+        'loaded_config_digest':config_digest,'loaded_image_id':actual_id,'selected_route':selected,'route_samples':samples,
+        'cloud_reported_image_size':args.image_size,'loaded_reported_image_size':info['Size'],
+        'store_size_reporting_difference':info['Size']-args.image_size,'archive_proof':archive_proof,
         'crane_archive_sha256':TOOL_SHA,'docker_daemon_proxy_changed':False,'builds_or_dependency_installs':0}
     (root/'last-image-pull.safe.json').write_text(json.dumps(receipt,indent=2)+'\n')
     print(json.dumps(receipt))
@@ -231,5 +382,3 @@ def main():
 if __name__=='__main__':
     try:main()
     except Exception as error:raise SystemExit('Verified image pull failed: '+str(error)if isinstance(error,RuntimeError)else'Verified image pull failed (details redacted)')
-
-
