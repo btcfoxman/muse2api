@@ -30,6 +30,11 @@ ACCEPT=', '.join(('application/vnd.oci.image.index.v1+json','application/vnd.oci
 class NoRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self,*args,**kwargs):return None
 
+class ArtifactHTTPError(RuntimeError):
+    def __init__(self,status):
+        self.status=int(status)
+        super().__init__('registry_http_rejected:status='+str(self.status))
+
 def command(args,env=None,timeout=30,stage='docker_operation'):
     if not re.fullmatch(r'[a-z_]{1,48}',stage):raise ValueError('invalid operation stage')
     try:result=subprocess.run(args,env=env,capture_output=True,timeout=timeout)
@@ -57,7 +62,8 @@ def response(url,proxy,headers=None,timeout=10):
             raise RuntimeError('unexpected_artifact_redirect')
         try:return client.open(urllib.request.Request(url,headers=headers),timeout=timeout)
         except urllib.error.HTTPError as error:
-            if error.code not in{301,302,303,307,308}:error.close();raise RuntimeError('registry_http_rejected')from None
+            if error.code not in{301,302,303,307,308}:
+                status=error.code;error.close();raise ArtifactHTTPError(status)from None
             target=urllib.parse.urljoin(url,error.headers.get('Location',''));error.close()
             if urllib.parse.urlsplit(target).hostname!=parsed.hostname:headers.pop('Authorization',None)
             url=target
@@ -89,23 +95,31 @@ def basic_auth():
     raise RuntimeError('isolated_registry_login_required')
 
 def sample(url,proxy,headers):
-    size=1048576;start=time.monotonic();got=0
-    def expired(*_):raise TimeoutError()
+    size=1048576;start=time.monotonic();got=0;failure=None;headers_at=None
+    class SampleDeadline(TimeoutError):pass
+    def expired(*_):raise SampleDeadline()
     previous=signal.signal(signal.SIGALRM,expired)
     signal.setitimer(signal.ITIMER_REAL,12)
     try:
         with response(url,proxy,{**headers,'Range':'bytes=0-1048575','Accept-Encoding':'identity'},timeout=8)as stream:
-            if stream.status!=206:raise RuntimeError('range_not_supported')
-            while got<size:
-                chunk=stream.read(min(65536,size-got))
-                if not chunk:break
-                got+=len(chunk)
-        good=got==size
-    except Exception:good=False
+            headers_at=time.monotonic()
+            if stream.status not in{200,206}:failure='http_status_'+str(stream.status)
+            else:
+                while got<size:
+                    chunk=stream.read(min(65536,size-got))
+                    if not chunk:break
+                    got+=len(chunk)
+                if got!=size:failure='short_read'
+    except SampleDeadline:failure='deadline'
+    except ArtifactHTTPError as error:failure='http_status_'+str(error.status)
+    except Exception as error:failure='exception_'+type(error).__name__
     finally:signal.setitimer(signal.ITIMER_REAL,0);signal.signal(signal.SIGALRM,previous)
-    seconds=time.monotonic()-start
-    return{'route':'proxy'if proxy else'direct','complete':good,'bytes':got,'seconds':round(seconds,3),
-        'bytes_per_second':round(got/max(seconds,.001),2)}
+    finished=time.monotonic();seconds=finished-start
+    body_seconds=max(0,finished-headers_at)if headers_at is not None else 0
+    return{'route':'proxy'if proxy else'direct','complete':failure is None and got==size,
+        'failure_kind':failure,'bytes':got,'seconds':round(seconds,3),
+        'ttfb_seconds':round(headers_at-start,3)if headers_at is not None else None,
+        'body_seconds':round(body_seconds,3),'bytes_per_second':round(got/max(body_seconds,.001),2)}
 
 def acquire_tool(folder,routes,cache):
     cache.mkdir(parents=True,exist_ok=True,mode=0o700)
@@ -342,7 +356,9 @@ def main():
     layer=max(layers,key=lambda row:row['size'])
     samples=[sample('https://ghcr.io/v2/'+repository+'/blobs/'+layer['digest'],route,authorization)for route in routes]
     ordered=sorted(zip(routes,samples),key=lambda pair:(pair[1]['complete'],pair[1]['bytes_per_second']),reverse=True)
-    if not any(item['complete']for _,item in ordered):raise RuntimeError('image_transfer_routes_unavailable')
+    if not any(item['complete']for _,item in ordered):
+        print(json.dumps({'stage':'image_transfer_samples','route_samples':samples}),flush=True)
+        raise RuntimeError('image_transfer_routes_unavailable')
     compressed=sum(row['size']for row in manifest['layers'])
     check_disk_budget(root,compressed,args.image_size)
     with tempfile.TemporaryDirectory(prefix='verified-pull-',dir=root/'.pull-tools')as temporary:
